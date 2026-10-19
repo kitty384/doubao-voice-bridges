@@ -1,0 +1,19 @@
+name: macOS build and logic checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run logic tests
+        run: bash scripts/test.sh
+      - name: Build universal applications
+        run: bash scripts/build.sh

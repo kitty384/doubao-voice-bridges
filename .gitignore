@@ -1,0 +1,10 @@
+.DS_Store
+**/.build/
+**/dist/
+*.app/
+*.zip
+*.dmg
+*.log
+.env
+.env.*
+!.env.example
