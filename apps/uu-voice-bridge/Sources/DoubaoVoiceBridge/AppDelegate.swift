@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import ApplicationServices
 import os.log
 
@@ -37,6 +38,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let logger = Logger(subsystem: "com.lyp.DoubaoVoiceBridge.Fn", category: "app")
     private let coordinator = SessionCoordinator()
+    private let requestServer = ComposerRequestServer()
+    private var workspaceObserver: NSObjectProtocol?
+    private var healthTimer: Timer?
     private var monitor: TriggerHoldMonitor?
     private var statusItem: NSStatusItem?
     private var statusText = "已暂停 · 点击菜单启用 Fn 听写"
@@ -50,7 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.register(defaults: [
             "pasteDelay": UURemoteDelivery.defaultPasteDelay,
             "autoPasteUU": true,
-            "fnHoldThreshold": 0.18
+            "fnHoldThreshold": 0.18,
+            "legacyHoldToTalk": false
         ])
         UserDefaults.standard.set(true, forKey: "autoPasteUU")
         migrateLatencyDefaultsIfNeeded()
@@ -61,6 +66,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.setStatus(text, isError: isError)
         }
         configureMonitor()
+        requestServer.onRequest = { [weak self] request, reply in
+            guard let self else { reply("unavailable"); return }
+            self.handleHeadsetRequest(request, reply: reply)
+        }
+        requestServer.start()
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self?.monitor?.refreshForForegroundTransition(isUU: app?.bundleIdentifier == Self.uuRemoteBundleIdentifier)
+        }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.updatePermissionDisplay() }
+        healthTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
         // Permission changes never install an event tap. Every launch remains
         // paused until the user explicitly chooses Enable from the menu.
         setStatus("已暂停 · 点击菜单启用 Fn 听写", isError: false)
@@ -87,15 +106,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func configureMonitor() {
         let monitor = TriggerHoldMonitor(
             holdThreshold: UserDefaults.standard.double(forKey: "fnHoldThreshold"),
+            voiceHoldEnabled: UserDefaults.standard.bool(forKey: "legacyHoldToTalk"),
             targetProvider: { [weak self] in
                 guard let self, self.monitoringState == .active,
-                      self.coordinator.canBegin else { return nil }
+                      self.coordinator.canRequestComposer else { return nil }
                 return self.currentUURemoteTarget()
             },
             localComposerReady: { [weak self] in
                 self?.coordinator.isLocalComposerReady ?? false
             },
-            onBegin: { [weak self] target, mode in self?.coordinator.begin(target: target, mode: mode) },
+            onBegin: { [weak self] target, mode in
+                guard let self else { return false }
+                return self.coordinator.begin(target: target, mode: mode, activationAllowed: {
+                    self.monitoringState == .active && !IsSecureEventInputEnabled() &&
+                    self.currentUURemoteTarget()?.processIdentifier == target.processIdentifier
+                })
+            },
             onRelease: { [weak self] in self?.coordinator.fnReleased() },
             onCancel: { [weak self] in self?.coordinator.cancel(restoreFocus: false) }
         )
@@ -109,6 +135,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        healthTimer?.invalidate()
+        if let workspaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver) }
         startGeneration &+= 1
         monitoringState = .paused
         monitor?.stop()
@@ -172,12 +200,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(pause)
         menu.addItem(.separator())
 
-        let instruction = NSMenuItem(title: "UU 中轻按 Fn 开框；长按 Fn 听写", action: nil, keyEquivalent: "")
+        let instruction = NSMenuItem(title: "UU 中第一次 Fn / 线控开框，框内再听写", action: nil, keyEquivalent: "")
         instruction.isEnabled = false
         menu.addItem(instruction)
-        let doubaoHint = NSMenuItem(title: "豆包保持 Fn / 🌐 按住说话设置", action: nil, keyEquivalent: "")
+        let doubaoHint = NSMenuItem(title: "豆包保留原生 Fn 设置；回车发送", action: nil, keyEquivalent: "")
         doubaoHint.isEnabled = false
         menu.addItem(doubaoHint)
+        let legacy = NSMenuItem(title: "兼容模式：长按 Fn 直接听写", action: #selector(toggleLegacyHold), keyEquivalent: "")
+        legacy.target = self
+        legacy.state = UserDefaults.standard.bool(forKey: "legacyHoldToTalk") ? .on : .off
+        menu.addItem(legacy)
         menu.addItem(.separator())
 
         let ax = NSMenuItem(title: "", action: #selector(openAccessibilitySettings), keyEquivalent: "")
@@ -224,7 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .success:
                 self.monitoringState = .active
                 monitor.refreshEligibility()
-                self.setStatus("就绪 · UU 中轻按 Fn 开框，长按 Fn 听写", isError: false)
+                self.setStatus("监听已启用 · UU 首次开框，框内 Fn / 线控听写", isError: false)
             case .failure(let error):
                 self.logger.error("Fn monitor start failed: \(error.localizedDescription, privacy: .public)")
                 self.pauseMonitoring(status: "已暂停 · \(error.localizedDescription)", isError: true)
@@ -258,7 +290,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .starting: state = "starting"
         case .active: state = "active"
         }
-        GUIRuntimeStatus.write(permissions: permissions, state: state, message: statusText)
+        var details = monitor?.diagnosticSnapshot ?? [:]
+        details.merge(coordinator.diagnosticSnapshot) { _, new in new }
+        details["frontmost_is_uu"] = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.uuRemoteBundleIdentifier
+        GUIRuntimeStatus.write(permissions: permissions, state: state, message: statusText, details: details)
+    }
+
+    @objc private func toggleLegacyHold() {
+        pauseMonitoring(status: "已暂停 · 模式已切换，请重新启用", isError: false)
+        let enabled = !UserDefaults.standard.bool(forKey: "legacyHoldToTalk")
+        UserDefaults.standard.set(enabled, forKey: "legacyHoldToTalk")
+        monitor?.voiceHoldEnabled = enabled
+        rebuildMenu()
+    }
+
+    private func handleHeadsetRequest(_ request: ComposerOpenRequest, reply: @escaping (String) -> Void) {
+        guard monitoringState == .active, let monitor else { reply("paused"); return }
+        guard !IsSecureEventInputEnabled(), PermissionStatus.current().ready else { reply("blocked"); return }
+        guard let target = currentUURemoteTarget(), target.processIdentifier == request.targetPID else { reply("focusChanged"); return }
+        guard monitor.isGestureIdle, coordinator.canRequestComposer else { reply("busy"); return }
+        guard target.captureFocusedWindow() else { reply("unavailable"); return }
+        guard request.isFresh(), currentUURemoteTarget()?.processIdentifier == request.targetPID,
+              !IsSecureEventInputEnabled() else { reply("focusChanged"); return }
+        let restoring = coordinator.state == .listening || coordinator.state == .failed
+        // Disable interception BEFORE activating the local panel. Its next Fn
+        // belongs to Doubao even if the foreground polling tick has not run.
+        monitor.suspendEligibilityForComposer()
+        guard coordinator.begin(target: target, mode: .tapToCompose, activationAllowed: {
+            request.isFresh() && self.monitoringState == .active && !IsSecureEventInputEnabled() &&
+            self.currentUURemoteTarget()?.processIdentifier == request.targetPID
+        }) else { reply("busy"); return }
+        confirmComposerReady(generation: startGeneration, deadline: ProcessInfo.processInfo.systemUptime + 0.35,
+                             success: restoring ? "restored" : "opened", reply: reply)
+    }
+
+    private func confirmComposerReady(generation: UInt64, deadline: TimeInterval, success: String,
+                                      reply: @escaping (String) -> Void) {
+        guard monitoringState == .active, startGeneration == generation else { reply("paused"); return }
+        if coordinator.isLocalComposerReady { reply(success); return }
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        guard front == Self.uuRemoteBundleIdentifier || front == Bundle.main.bundleIdentifier else { reply("focusChanged"); return }
+        guard ProcessInfo.processInfo.systemUptime < deadline else { reply("unavailable"); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            guard let self else { reply("unavailable"); return }
+            self.confirmComposerReady(generation: generation, deadline: deadline, success: success, reply: reply)
+        }
     }
 
     @objc private func openAccessibilitySettings() {

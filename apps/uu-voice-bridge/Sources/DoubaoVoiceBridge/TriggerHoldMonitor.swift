@@ -11,10 +11,17 @@ enum TriggerMonitorError: LocalizedError {
 final class TriggerHoldMonitor {
     static let syntheticEventMarker: Int64 = 0x4456_4252
     var onFault: ((String) -> Void)?
+    var voiceHoldEnabled: Bool
+    private var drainingWorker: FnInputTap?
+    private var pendingStart: (() -> Void)?
+    private var foregroundRearm = FnForegroundRearmPolicy()
+    private var foregroundIsUU = false
+    private var composerHandoff = FnComposerHandoffPolicy()
+    private var rearmWorkItem: DispatchWorkItem?
     private let holdThreshold: TimeInterval
     private let targetProvider: () -> UURemoteTarget?
     private let localComposerReady: () -> Bool
-    private let onBegin: (UURemoteTarget, ComposerEntryMode) -> Void
+    private let onBegin: (UURemoteTarget, ComposerEntryMode) -> Bool
     private let onRelease: () -> Void
     private let onCancel: () -> Void
     private var worker: FnInputTap?
@@ -32,10 +39,11 @@ final class TriggerHoldMonitor {
     private(set) var activeTapLocation: CGEventTapLocation?
     var isGestureIdle: Bool { gesture.phase == .idle }
 
-    init(holdThreshold: TimeInterval, targetProvider: @escaping () -> UURemoteTarget?,
-         localComposerReady: @escaping () -> Bool, onBegin: @escaping (UURemoteTarget, ComposerEntryMode) -> Void,
+    init(holdThreshold: TimeInterval, voiceHoldEnabled: Bool = false, targetProvider: @escaping () -> UURemoteTarget?,
+         localComposerReady: @escaping () -> Bool, onBegin: @escaping (UURemoteTarget, ComposerEntryMode) -> Bool,
          onRelease: @escaping () -> Void, onCancel: @escaping () -> Void) {
         self.holdThreshold = min(max(holdThreshold, 0.18), 0.60)
+        self.voiceHoldEnabled = voiceHoldEnabled
         self.targetProvider = targetProvider
         self.localComposerReady = localComposerReady
         self.onBegin = onBegin
@@ -48,6 +56,15 @@ final class TriggerHoldMonitor {
         guard worker == nil else { return }
         generation += 1
         let expected = generation
+        let launch = { [weak self] in
+            guard let self, self.generation == expected else { return }
+            self.launch(expected: expected, completion: completion)
+        }
+        if drainingWorker != nil { pendingStart = launch }
+        else { launch() }
+    }
+
+    private func launch(expected: Int, completion: @escaping (Result<Void, Error>) -> Void) {
         let input = FnInputTap(onSignal: { [weak self] signal in
             guard let self, self.generation == expected else { return }
             self.handle(signal)
@@ -63,9 +80,11 @@ final class TriggerHoldMonitor {
             case .success:
                 self.activeTapLocation = .cghidEventTap
                 self.refreshEligibility()
-                self.timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
                     self?.auditAndRefresh()
                 }
+                self.timer = timer
+                RunLoop.main.add(timer, forMode: .common)
             case .failure: self.stop()
             }
             completion(result)
@@ -75,9 +94,22 @@ final class TriggerHoldMonitor {
     func stop() {
         precondition(Thread.isMainThread)
         generation += 1
-        // Detach global input before any UI cleanup that could block the main thread.
-        worker?.stop()
-        worker = nil
+        pendingStart = nil
+        composerHandoff.reset()
+        rearmWorkItem?.cancel(); rearmWorkItem = nil
+        // Wait for the old run loop to exit before any subsequent start. A pause
+        // or a newer start invalidates queued launch closures through generation.
+        if let old = worker {
+            worker = nil
+            drainingWorker = old
+            old.stop { [weak self, weak old] in
+                guard let self, self.drainingWorker === old else { return }
+                self.drainingWorker = nil
+                let launch = self.pendingStart
+                self.pendingStart = nil
+                launch?()
+            }
+        }
         activeTapLocation = nil
         timer?.invalidate(); timer = nil
         reset(notifyCancel: true)
@@ -85,13 +117,65 @@ final class TriggerHoldMonitor {
 
     func refreshEligibility() {
         precondition(Thread.isMainThread)
-        worker?.setEligible(gesture.phase == .idle && targetProvider() != nil && !IsSecureEventInputEnabled())
+        let targetAllowed = composerHandoff.allowsEligibility(
+            targetAvailable: targetProvider() != nil, now: ProcessInfo.processInfo.systemUptime)
+        worker?.setEligible(gesture.phase == .idle && targetAllowed && !IsSecureEventInputEnabled())
+    }
+
+    func suspendEligibilityForComposer() {
+        precondition(Thread.isMainThread)
+        composerHandoff.suspend(now: ProcessInfo.processInfo.systemUptime)
+        worker?.setEligible(false)
+    }
+
+    var diagnosticSnapshot: [String: Any] {
+        precondition(Thread.isMainThread)
+        var snapshot = worker?.diagnosticSnapshot ?? [
+            "tap_valid": false, "tap_enabled": false, "eligible": false,
+            "filter_phase": "idle", "fn_down_count": 0, "fn_up_count": 0]
+        snapshot["gesture_phase"] = String(describing: gesture.phase)
+        snapshot["voice_hold_enabled"] = voiceHoldEnabled
+        snapshot["teardown_pending"] = drainingWorker != nil
+        return snapshot
+    }
+
+    /// One bounded refresh on entering UU; never chase another app's tap order.
+    /// macOS-disabled taps stay paused until an explicit user action.
+    func refreshForForegroundTransition(isUU: Bool) {
+        precondition(Thread.isMainThread)
+        foregroundIsUU = isUU
+        let entered = foregroundRearm.enteredUU(isUU)
+        if !isUU {
+            rearmWorkItem?.cancel(); rearmWorkItem = nil
+            composerHandoff.reset()
+        }
+        refreshEligibility()
+        guard entered, worker != nil else { return }
+        let expected = generation
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == expected, self.foregroundIsUU,
+                  self.worker?.isIdle == true, self.gesture.phase == .idle,
+                  self.targetProvider() != nil, !IsSecureEventInputEnabled() else { return }
+            let flags = CGEventSource.flagsState(.hidSystemState)
+            guard flags.intersection(FnKeyPolicy.conflictingFlags.union(.maskSecondaryFn)).isEmpty,
+                  self.foregroundRearm.allow(now: ProcessInfo.processInfo.systemUptime),
+                  self.worker?.reserveForegroundRearm(physicalKeysReleased: true) == true else { return }
+            self.stop()
+            self.start { [weak self] result in
+                if case .failure(let error) = result { self?.onFault?(error.localizedDescription) }
+            }
+        }
+        rearmWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: item)
     }
 
     private func handle(_ signal: FnTapSignal) {
         precondition(Thread.isMainThread)
         switch signal {
         case .pressed(let id, let source):
+            // Main may have been busy long enough for watchdog recovery before
+            // this queued down was handled. Do not revive that abandoned press.
+            guard worker?.wasRecovered(press: id) == false else { return }
             guard gesture.phase == .idle, let target = targetProvider(), !IsSecureEventInputEnabled() else {
                 worker?.cancelOwnedPress(); return
             }
@@ -99,7 +183,7 @@ final class TriggerHoldMonitor {
             activePressID = id
             composerOpenedForPress = false
             _ = gesture.handle(.triggerDown(targetAvailable: true))
-            if FnKeyPolicy.schedulesVoiceHold(source: source) {
+            if voiceHoldEnabled && FnKeyPolicy.schedulesVoiceHold(source: source) {
                 let item = DispatchWorkItem { [weak self] in self?.activate() }
                 activationWorkItem = item
                 DispatchQueue.main.asyncAfter(deadline: .now() + holdThreshold, execute: item)
@@ -147,8 +231,9 @@ final class TriggerHoldMonitor {
         }
         // The physical release has already happened: no synthetic Fn-down.
         // Reset first so no voice watchdog can cancel the typing session.
+        suspendEligibilityForComposer()
         reset(notifyCancel: false)
-        onBegin(target, .tapToCompose)
+        if !onBegin(target, .tapToCompose) { composerHandoff.reset() }
     }
 
     private func activate() {
@@ -165,8 +250,16 @@ final class TriggerHoldMonitor {
         _ = gesture.handle(.thresholdReached)
         target.captureFocusedWindow()
         guard worker?.isDictating(press: id) == true else { return }
+        suspendEligibilityForComposer()
+        guard onBegin(target, .holdToTalk) else {
+            // A rejected begin may have restored a pre-existing draft. Never
+            // synthesize recording events or cancel that unrelated session.
+            worker?.cancelOwnedPress()
+            reset(notifyCancel: false)
+            composerHandoff.reset()
+            return
+        }
         composerOpenedForPress = true
-        onBegin(target, .holdToTalk)
         localFocusDeadline = Date().addingTimeInterval(0.75)
         checkComposer()
     }
@@ -190,7 +283,11 @@ final class TriggerHoldMonitor {
     }
 
     private func auditAndRefresh() {
-        worker?.recoverIfReleased()
+        if let recoveredID = worker?.recoverIfReleased(), activePressID == recoveredID {
+            // Recovery abandons this exact press; it must never submit text or
+            // cancel a newer gesture whose down was already queued on main.
+            reset(notifyCancel: true)
+        }
         if gesture.phase == .dictating &&
             (IsSecureEventInputEnabled() || (syntheticDownAt != nil &&
                 (!localComposerReady() || Date().timeIntervalSince(syntheticDownAt!) > 90))) {

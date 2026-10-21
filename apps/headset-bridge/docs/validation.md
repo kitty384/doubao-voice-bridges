@@ -1,5 +1,11 @@
 # 验证说明
 
+## 1.2 协作路由验证
+
+- 保留原有 35 个按键状态场景与 21 个解码 / 筛选断言。
+- 新增 43 条纯策略断言且测试通过，覆盖本地 / UU / 发送框路由、接收端缺失、重复点击、请求 ID 匹配、7 种确认状态、0.8 秒超时、过期确认、取消后回调和用户重试。
+- macOS 12 目标的 arm64 / x86_64 构建、通用架构、Info.plist 和 ad-hoc 签名校验通过。消息策略测试不代表系统消息投递或录音成功；上述构建和策略测试不启动 GUI、接管实体线控或录音。
+
 ## 2026-10-19 发布整理结果
 
 - 纯逻辑测试通过：35 个按键状态场景与 21 个解码 / 筛选断言。
@@ -9,7 +15,7 @@
 
 ## 测试边界
 
-`test.sh` 只编译 `MappingCore.swift` 与 `Tests/main.swift`。它使用合成数据检查 HID 解码、精确设备筛选、按下与释放配对、重复报告去重、180 毫秒去抖、资格切换、修饰键抑制与状态重置，不会抓取真实 HID、录音或注入按键。
+`test.sh` 只编译 `MappingCore.swift` 与 `Tests/main.swift`。它使用合成数据检查 HID 解码、精确设备筛选、按下与释放配对、重复报告去重、180 毫秒去抖、资格切换、修饰键抑制与状态重置，以及本机协作的路由 / 确认策略，不会抓取真实 HID、录音或注入按键。
 
 `build.sh` 编译 macOS 12 目标的 arm64 与 x86_64 二进制、合并为通用可执行文件、校验 Info.plist 并验证 ad-hoc 签名。它不会启动应用或请求权限。编译 Intel 架构并不等于已经在 Intel Mac 上运行验证。
 
@@ -21,7 +27,9 @@
 2. 先在普通本地输入框确认豆包 Fn 基线正常，再按耳机中间键，确认豆包接受合成 Fn，能够开始并结束语音。
 3. 确认中间键不会播放 / 暂停音乐，音量加减与长按重复正常。
 4. 按住修饰键再按中间键，确认不会额外启动听写；暂停与退出后应恢复系统线控行为。
-5. 与 UU 桥接联用时，先确认两台 Mac 的文字剪贴板同步，再确认 Fn 开框、框内豆包录音 / 转写和远端发送各步骤。
+5. 与新版 UU 桥接联用时，先确认两台 Mac 的文字剪贴板同步。UU 前台第一次线控点击只开框，等待框获得焦点后，第二次线控点击由豆包开始录音；结束后确认文字并按 Return 发送。
+6. UU 桥接退出、暂停或不兼容时，在 UU 点击线控应显示对应失败状态，且不应补发 Fn。等待过程中连续点击不应形成重复请求。
+7. 开框等待过程中切换窗口、断开耳机或暂停桥接，确认不会在延迟确认到达后注入 Fn；恢复后新的一次点击应可继续使用。
 
 出现接管冲突时退出其他映射工具。若目标输入法不接受合成 Fn，应如实报告对应系统与输入法版本；不要把图标、录音浮条或 Fn 逻辑测试通过视为转写成功。
 
@@ -32,6 +40,6 @@
 - `Sources/AudioRoute.swift`：CoreAudio 连接条件；它不读取音频流。
 - `Sources/main.swift`：菜单、偏好、Fn 和音量事件合成。
 
-Fn 使用虚拟键码 `63`、`flagsChanged`、`maskSecondaryFn`，按下后约 60 毫秒释放。Fn 与音量事件携带 `eventSourceUserData = 0x444f5542414f`（ASCII `DOUBAO`）。UU 桥接器可借此识别受支持的耳机入口。它只标记软件来源，不保证后续消费者接受这些事件。
+Fn 使用虚拟键码 `63`、`flagsChanged`、`maskSecondaryFn`，按下后约 60 毫秒释放。Fn 与音量事件携带 `eventSourceUserData = 0x444f5542414f`（ASCII `DOUBAO`）。该标记仅说明软件来源，不保证后续消费者接受这些事件。1.2 在 UU 前台使用 `com.doubao.voicebridges.openComposer.v1` 消息，发送框内才使用 Fn。回复使用 `com.doubao.voicebridges.openComposerReply.v1`，两者的 object 均为 `com.doubao.voicebridges.local`。接收端需要实现同一协议；确认消息不会调用 Fn 合成。
 
 独占接口使用 Apple 的 [IOHIDDeviceOpen](https://developer.apple.com/documentation/iokit/1588670-iohiddeviceopen) 与 `kIOHIDOptionsTypeSeizeDevice`。具体运行行为应以目标系统的返回结果和手工验收为准。

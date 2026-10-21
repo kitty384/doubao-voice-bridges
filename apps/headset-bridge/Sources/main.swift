@@ -16,6 +16,10 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var heldVolumeKeys = Set<Int>()
     private var pendingFnUp: CGEvent?
     private var shortcutGeneration = 0
+    private var composerRouting = ComposerRoutingState()
+    private var composerTimeout: DispatchWorkItem?
+    private var replyObserver: NSObjectProtocol?
+    private var cooperativeStatus: String?
     private let marker: Int64 = 0x444f5542414f
 
     private var inputAllowed: Bool {
@@ -29,7 +33,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !enabled { return "映射已暂停" }
         if !AXIsProcessTrusted() { return "请允许辅助功能权限" }
         if onlyHeadphones && !route.headphoneConnected { return "等待连接外置耳机" }
-        if capture.capturedCount > 0 { return "已启用：耳机中间键 → Fn；音乐控制已拦截" }
+        if capture.capturedCount > 0 { return cooperativeStatus ?? "已启用：本地 Fn / UU 开框；音乐控制已拦截" }
         if capture.lastError != nil {
             return inputAllowed ? "线控接管未就绪，请重新检测或退出其他映射工具" : "线控接管未就绪，请允许输入监控并重新打开"
         }
@@ -46,12 +50,19 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+        replyObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name(ComposerProtocol.replyName),
+            object: ComposerProtocol.object, queue: .main
+        ) { [weak self] notification in
+            self?.receiveComposerReply(notification)
+        }
         capture.onButton = { [weak self] button, state in self?.handle(button, state: &state) }
         capture.onChange = { [weak self] in
             guard let self else { return }
+            self.shortcutGeneration += 1
+            self.cancelComposerRequest()
+            self.releaseFn()
             if self.capture.capturedCount == 0 {
-                self.shortcutGeneration += 1
-                self.releaseFn()
                 self.releaseVolumeKeys()
             }
             self.refreshText()
@@ -66,12 +77,23 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !AXIsProcessTrusted() || capture.lastError != nil { showWindow() }
     }
 
+    private func updateRoute() {
+        let next = AudioRoute.inspect()
+        if next.headphoneConnected != route.headphoneConnected || next.summary != route.summary {
+            shortcutGeneration += 1
+            cancelComposerRequest()
+            releaseFn()
+        }
+        route = next
+    }
+
     private func updateCapture() {
-        route = AudioRoute.inspect()
+        updateRoute()
         capture.start()
         // The Headset interface is permanent. Keep it captured across plug-in
         // so the first click cannot reach Music before a route polling tick.
         let requested = captureRequested
+        if !mappingRequested { cancelComposerRequest() }
         if !requested {
             shortcutGeneration += 1
             releaseFn()
@@ -83,7 +105,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func handle(_ button: MediaButton, state: inout MappingState) {
         guard captureRequested else { return }
-        route = AudioRoute.inspect()
+        updateRoute()
         if button.key == 0 || button.key == 1 {
             handleVolume(button)
             return
@@ -97,14 +119,103 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let generation = shortcutGeneration
             DispatchQueue.main.async { [weak self] in
                 guard let self, generation == self.shortcutGeneration, self.mappingRequested else { return }
-                self.sendFn()
+                self.routeShortcut()
             }
         }
         // The exclusive open already consumes the original report. Never
         // re-post play/pause, including when another modifier is held.
     }
 
+    private func routeShortcut() {
+        guard mappingRequested else { cancelComposerRequest(); return }
+        let foregroundApp = NSWorkspace.shared.frontmostApplication
+        let foreground = foregroundApp?.bundleIdentifier
+        let bridgeRunning = !NSRunningApplication.runningApplications(
+            withBundleIdentifier: ComposerProtocol.bridgeBundleID).isEmpty
+        let action = composerRouting.route(frontmostBundleID: foreground,
+            bridgeRunning: bridgeRunning, requestID: UUID().uuidString,
+            now: ProcessInfo.processInfo.systemUptime)
+        switch action {
+        case .localFn:
+            cooperativeStatus = nil
+            sendFn()
+        case .openComposer(let requestID):
+            guard let targetPID = foregroundApp?.processIdentifier else {
+                cancelComposerRequest()
+                return
+            }
+            composerTimeout?.cancel()
+            cooperativeStatus = "等待远控听写打开发送框…"
+            let timeout = DispatchWorkItem { [weak self] in
+                guard let self, self.composerRouting.expire(requestID: requestID,
+                    now: ProcessInfo.processInfo.systemUptime) else { return }
+                self.composerTimeout = nil
+                self.cooperativeStatus = "远控听写未回应；请检查是否启用或更新到协作版本"
+                self.refreshText()
+            }
+            composerTimeout = timeout
+            DispatchQueue.main.asyncAfter(deadline: .now() + ComposerProtocol.timeout, execute: timeout)
+            DistributedNotificationCenter.default().postNotificationName(
+                Notification.Name(ComposerProtocol.requestName), object: ComposerProtocol.object,
+                userInfo: ["requestID": requestID,
+                           "targetPID": Int(targetPID),
+                           "sentAt": Date().timeIntervalSince1970], deliverImmediately: true)
+        case .waiting:
+            break
+        case .bridgeUnavailable:
+            cooperativeStatus = "请先启动远控听写，再按线控打开发送框"
+        case .noForeground:
+            cooperativeStatus = "未确定当前应用；请选中输入框后重试"
+        }
+        refreshText()
+    }
+
+    private func receiveComposerReply(_ notification: Notification) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let pending = composerRouting.pendingID,
+           composerRouting.expire(requestID: pending, now: now) {
+            composerTimeout?.cancel()
+            composerTimeout = nil
+            cooperativeStatus = "远控听写未及时回应；请检查状态后重试"
+            refreshText()
+            return
+        }
+        guard let requestID = notification.userInfo?["requestID"] as? String,
+              let status = notification.userInfo?["status"] as? String,
+              let reply = composerRouting.acknowledge(requestID: requestID, status: status, now: now) else { return }
+        composerTimeout?.cancel()
+        composerTimeout = nil
+        switch reply {
+        case .opened, .restored:
+            cooperativeStatus = "发送框已打开；再按线控启动豆包，转写后按 Return 发送"
+        case .busy:
+            cooperativeStatus = "远控听写正在处理上一轮；请完成后再试"
+        case .paused:
+            cooperativeStatus = "远控听写已暂停；请先启用 Fn 听写"
+        case .blocked:
+            cooperativeStatus = "远控听写暂时阻止开框；请检查其菜单状态"
+        case .focusChanged:
+            cooperativeStatus = "焦点已切换；请回到 UU 后重试"
+        case .unavailable:
+            cooperativeStatus = "远控听写暂不可用；请检查其菜单状态"
+        }
+        refreshText()
+    }
+
+    private func cancelComposerRequest() {
+        composerTimeout?.cancel()
+        composerTimeout = nil
+        composerRouting.cancel()
+        cooperativeStatus = nil
+    }
+
     private func sendFn() {
+        // Recheck immediately before event synthesis: focus may have changed
+        // since the captured HID press was queued on the main thread.
+        guard let foreground = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              !foreground.isEmpty else { return }
+        if foreground == ComposerProtocol.uuBundleID { routeShortcut(); return }
+
         guard AXIsProcessTrusted(), pendingFnUp == nil else { return }
         let current = CGEventSource.flagsState(.combinedSessionState)
         guard current.intersection([.maskCommand, .maskControl, .maskAlternate,
@@ -118,6 +229,9 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         up.flags = current
         down.setIntegerValueField(.eventSourceUserData, value: marker)
         up.setIntegerValueField(.eventSourceUserData, value: marker)
+        let latestForeground = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        if latestForeground == ComposerProtocol.uuBundleID { routeShortcut(); return }
+        guard latestForeground == foreground, mappingRequested else { return }
         pendingFnUp = up
         down.post(tap: .cghidEventTap)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
@@ -174,7 +288,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item(menu, status, nil)
         item(menu, "外置耳机：\(route.headphoneConnected ? "已连接" : "未连接")", nil)
         menu.addItem(.separator())
-        item(menu, enabled ? "暂停 Fn 映射" : "启用耳机中间键 → Fn", #selector(toggleEnabled))
+        item(menu, enabled ? "暂停线控桥接" : "启用线控：本地 Fn / UU 开框", #selector(toggleEnabled))
         item(menu, "仅外置耳机连接时启用", #selector(toggleGate), checked: onlyHeadphones)
         menu.addItem(.separator())
         item(menu, "设置与使用说明…", #selector(showWindow))
@@ -205,6 +319,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateCapture()
     }
     @objc private func retry() {
+        cancelComposerRequest()
         shortcutGeneration += 1
         releaseFn()
         releaseVolumeKeys()
@@ -261,7 +376,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshText() {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2"
         statusItem?.button?.title = mappingRequested && capture.capturedCount > 0 ? "🎧Fn" : "🎧"
         statusItem?.button?.toolTip = status
         textView?.string = """
@@ -277,21 +392,29 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
            更新后若权限失效，请移除旧条目，重新添加当前程序并重新打开。
         3. 连接 3.5 mm 耳机；出现“音乐控制已拦截”后即可使用。
            如果线控未就绪，请允许“输入监控”并重新打开本程序。
-        4. 选中输入框，单击耳机中间键开始语音，再单击结束。
+        4. 本地输入框：单击中间键开始豆包语音，再单击结束。
+        5. UU 前台：第一次单击通知远控听写打开发送框。
+           框内再单击中间键开始豆包语音，结束后按 Return 发送。
+           需搭配支持协作消息的新版远控听写。
 
-        中间键只发送一次 Fn，不发送音乐播放或暂停。
+        本地中间键发送一次 Fn；UU 前台只发送开框请求。
+        请求未回应时会提示，不补发 Fn、不自动重试。
+        不发送音乐播放或暂停。
         按住其他修饰键时，中间键不触发 Fn，也不会控制音乐。
         耳机音量加减继续可用；键盘上的 Fn 和媒体键保持原功能。
         麦克风由豆包选择。本程序不录音、不联网、不记录按键日志或次数。
 
         映射默认启用并记住设置，正常启动只驻留菜单栏。
-        暂停映射或退出本程序后，耳机恢复系统原有功能。
+        暂停线控桥接或退出本程序后，耳机恢复系统原有功能。
         若耳机已连接但未检测到，可取消菜单中的“仅外置耳机连接时启用”。
         """
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        cancelComposerRequest()
+        if let replyObserver { DistributedNotificationCenter.default().removeObserver(replyObserver) }
+        replyObserver = nil
         shortcutGeneration += 1
         releaseFn()
         releaseVolumeKeys()

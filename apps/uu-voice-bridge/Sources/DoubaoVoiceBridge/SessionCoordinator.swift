@@ -21,6 +21,16 @@ final class SessionCoordinator {
         (state == .idle || state == .failed) && !deliveryAwaitingCleanup
     }
 
+    var canRequestComposer: Bool {
+        (state == .idle || state == .failed || state == .listening) && !deliveryAwaitingCleanup
+    }
+
+    var diagnosticSnapshot: [String: Any] {
+        ["session_state": String(describing: state), "composer_ready": isLocalComposerReady,
+         "composer_visible": panel.window?.isVisible ?? false,
+         "delivery_cleanup_pending": deliveryAwaitingCleanup]
+    }
+
     var isLocalComposerReady: Bool {
         state == .listening && panel.isReadyForLocalDictation
     }
@@ -31,22 +41,34 @@ final class SessionCoordinator {
         panel.onTranscriptTimeout = { [weak self] in self?.handleTranscriptTimeout() }
     }
 
-    func begin(target: UURemoteTarget, mode: ComposerEntryMode = .holdToTalk) {
-        if state == .listening, mode == .tapToCompose, self.target === target {
-            panel.switchToCompose()
-            onStatusChange?("发送框已打开 · 输入后回车发送，Esc 取消", false)
-            return
+    @discardableResult
+    func begin(target: UURemoteTarget, mode: ComposerEntryMode = .holdToTalk, activationAllowed: () -> Bool = { true }) -> Bool {
+        if (state == .listening || state == .failed), let original = self.target {
+            guard ComposerResumePolicy.permits(
+                sameProcess: original.processIdentifier == target.processIdentifier,
+                sameWindow: original.stillMatchesFocusedWindow(), delivering: deliveryAwaitingCleanup
+            ) else {
+                onStatusChange?("上一轮文字仍保留，请返回原 UU 窗口或先取消发送框", true)
+                return false
+            }
+            guard activationAllowed() else { return false }
+            state = .listening
+            panel.resumeCompose()
+            onStatusChange?("已恢复原发送框 · 文字保留，回车发送，Esc 取消", false)
+            return true
         }
         guard (state == .idle || state == .failed), !deliveryAwaitingCleanup else {
             onStatusChange?("正在完成上一轮发送，请稍候…", false)
-            return
+            return false
         }
+        guard activationAllowed() else { return false }
         self.target = target
         state = .listening
         panel.begin(targetDescription: "发送到远端 Mac · UU 远控", mode: mode)
         onStatusChange?(mode == .tapToCompose
-            ? "发送框已打开 · 输入后回车发送，Esc 取消"
+            ? "发送框已打开 · 再用 Fn 或线控听写，回车发送，Esc 取消"
             : "正在听写…松开 \(FnKeyPolicy.title) 后提交", false)
+        return true
     }
 
     func fnReleased() {
@@ -63,7 +85,7 @@ final class SessionCoordinator {
         state = .idle
         panel.hide()
         if restoreFocus { target?.activateOriginalWindow() }
-        onStatusChange?("就绪 · UU 中轻按开框，长按听写 · \(FnKeyPolicy.title)", false)
+        onStatusChange?("监听已启用 · UU 中按 Fn 开框，框内听写 · \(FnKeyPolicy.title)", false)
     }
 
     func prepareForTermination() {
@@ -102,7 +124,7 @@ final class SessionCoordinator {
                 self.deliveryAwaitingCleanup = false
                 if self.state == .delivering {
                     self.state = .idle
-                    self.onStatusChange?("就绪 · UU 中轻按开框，长按听写 · \(FnKeyPolicy.title)", false)
+                    self.onStatusChange?("监听已启用 · UU 中按 Fn 开框，框内听写 · \(FnKeyPolicy.title)", false)
                 }
             }
         )

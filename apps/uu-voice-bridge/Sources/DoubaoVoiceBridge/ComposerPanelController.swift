@@ -132,7 +132,7 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         lastTextChangeAt = Date()
         targetLabel.stringValue = targetDescription
         statusLabel.stringValue = mode == .tapToCompose
-            ? "输入后按回车发送；也可按住 Fn 听写，完成后回车确认"
+            ? "再用豆包 Fn 或线控听写；完成后回车发送，Esc 取消"
             : "正在启动豆包语音输入法…按住 \(FnKeyPolicy.title) 说话，松开后自动发送"
         statusLabel.textColor = .secondaryLabelColor
 
@@ -148,11 +148,22 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         )
     }
 
+    func resumeCompose() {
+        switchToCompose()
+        acceptsTranscriptUpdates = true
+        textView.isEditable = true
+        guard let window else { return }
+        position(window)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(textView)
+    }
+
     func switchToCompose() {
         entryMode = .tapToCompose
         isWaitingForFinalTranscript = false
         cancelSettleTimer()
-        statusLabel.stringValue = "输入后按回车发送；也可按住 Fn 听写，完成后回车确认"
+        statusLabel.stringValue = "再用豆包 Fn 或线控听写；完成后回车发送，Esc 取消"
         statusLabel.textColor = .secondaryLabelColor
     }
 

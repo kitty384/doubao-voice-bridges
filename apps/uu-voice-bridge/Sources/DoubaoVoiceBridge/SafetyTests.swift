@@ -82,6 +82,12 @@ enum SafetyTests {
         check(childStatus() == 0, "new process can acquire released lock")
         check(first.acquire(at: url), "guard can reacquire without unlinking")
         first.release()
+        let cooperative = CooperativeRoutingTests.run()
+        failures += cooperative.failures
+        count += cooperative.count
+        let routing = RoutingMonitorTests.run()
+        failures += routing.failures
+        count += routing.count
         return (failures, count)
     }
 }

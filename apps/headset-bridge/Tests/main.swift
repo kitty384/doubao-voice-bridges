@@ -77,3 +77,77 @@ precondition(isHeadphoneName("External Headphones"))
 precondition(isHeadphoneName("外置耳机"))
 precondition(!isHeadphoneName("MacBook Pro Speakers"))
 print("PASS: legacy/HID parsing, headset selection, one trigger per press, repeats, paired releases, eligibility, modifier capture, debounce/reset, non-target keys")
+
+
+// These routing checks intentionally use no AppKit, HID or notification center.
+// They cover where a physical click goes, including late/wrong replies and
+// cancellation; none of these tests sends a real Fn or opens a window.
+var routing = ComposerRoutingState()
+var routeAssertions = 0
+func expect(_ condition: @autoclosure () -> Bool, _ label: String) {
+    precondition(condition(), label)
+    routeAssertions += 1
+}
+let uu = ComposerProtocol.uuBundleID
+let composer = ComposerProtocol.bridgeBundleID
+expect(routing.route(frontmostBundleID: "com.apple.TextEdit", bridgeRunning: false,
+                     requestID: "unused", now: 0) == .localFn, "local works without receiver")
+expect(routing.route(frontmostBundleID: composer, bridgeRunning: true,
+                     requestID: "unused", now: 1) == .localFn, "composer uses native Doubao Fn")
+expect(routing.route(frontmostBundleID: nil, bridgeRunning: true,
+                     requestID: "unused", now: 2) == .noForeground, "unknown focus does not inject")
+expect(routing.route(frontmostBundleID: "", bridgeRunning: true,
+                     requestID: "unused", now: 3) == .noForeground, "empty focus does not inject")
+expect(routing.route(frontmostBundleID: uu, bridgeRunning: false,
+                     requestID: "unused", now: 4) == .bridgeUnavailable, "no receiver never falls back to Fn")
+expect(routing.pendingID == nil, "unavailable is not pending")
+expect(routing.route(frontmostBundleID: uu, bridgeRunning: true,
+                     requestID: "first", now: 5) == .openComposer("first"), "UU sends message")
+expect(routing.route(frontmostBundleID: uu, bridgeRunning: true,
+                     requestID: "duplicate", now: 5.2) == .waiting, "duplicate click suppressed")
+expect(routing.route(frontmostBundleID: composer, bridgeRunning: true,
+                     requestID: "focused", now: 5.3) == .waiting, "pending blocks premature Fn after focus moves")
+expect(routing.acknowledge(requestID: "wrong", status: "opened", now: 5.4) == nil,
+       "wrong nonce ignored")
+expect(routing.pendingID == "first", "wrong nonce preserves request")
+expect(routing.acknowledge(requestID: "first", status: "unknown", now: 5.4) == nil,
+       "unknown reply ignored")
+expect(routing.acknowledge(requestID: "first", status: "opened", now: 5.5) == .opened,
+       "successful reply accepted")
+expect(routing.pendingID == nil, "success clears pending")
+expect(routing.route(frontmostBundleID: composer, bridgeRunning: true,
+                     requestID: "next", now: 5.6) == .localFn, "second click in composer uses Fn")
+expect(routing.acknowledge(requestID: "first", status: "opened", now: 5.7) == nil,
+       "duplicate reply ignored")
+for status in ComposerReplyStatus.allCases {
+    _ = routing.route(frontmostBundleID: uu, bridgeRunning: true,
+                      requestID: status.rawValue, now: 10)
+    expect(routing.acknowledge(requestID: status.rawValue, status: status.rawValue, now: 10.1) == status,
+           "recognized status \(status.rawValue)")
+    expect(routing.pendingID == nil, "every recognized reply clears pending")
+}
+_ = routing.route(frontmostBundleID: uu, bridgeRunning: true, requestID: "timeout", now: 20)
+expect(!routing.expire(requestID: "wrong", now: 21), "stale timer cannot expire another request")
+expect(!routing.expire(requestID: "timeout", now: 20.7), "early timeout ignored")
+expect(routing.expire(requestID: "timeout", now: 20.8), "deadline clears request")
+expect(routing.acknowledge(requestID: "timeout", status: "opened", now: 20.9) == nil,
+       "late reply after timeout ignored")
+_ = routing.route(frontmostBundleID: uu, bridgeRunning: true, requestID: "late", now: 30)
+expect(routing.acknowledge(requestID: "late", status: "opened", now: 30.8) == nil,
+       "late reply rejected even before timeout callback")
+expect(routing.pendingID == nil, "expired acknowledgement clears state")
+_ = routing.route(frontmostBundleID: uu, bridgeRunning: true, requestID: "cancelled", now: 40)
+routing.cancel()
+expect(routing.pendingID == nil, "pause or device change cancels request")
+expect(routing.acknowledge(requestID: "cancelled", status: "opened", now: 40.1) == nil,
+       "reply after cancellation ignored")
+expect(!routing.expire(requestID: "cancelled", now: 41), "cancelled timer has no effect")
+_ = routing.route(frontmostBundleID: uu, bridgeRunning: true, requestID: "old", now: 50)
+expect(routing.route(frontmostBundleID: uu, bridgeRunning: true,
+                     requestID: "retry", now: 51) == .openComposer("retry"), "new user click can retry after timeout")
+expect(!routing.expire(requestID: "old", now: 51.1), "old timer cannot cancel retry")
+expect(routing.acknowledge(requestID: "old", status: "opened", now: 51.1) == nil,
+       "old reply cannot complete retry")
+expect(routing.acknowledge(requestID: "retry", status: "restored", now: 51.2) == .restored,
+       "retry can complete")
+print("PASS: \(routeAssertions) cooperative routing / acknowledgement assertions")

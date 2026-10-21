@@ -33,6 +33,10 @@ struct FnFilterState {
     mutating func cancel() {
         if phase == .pending || phase == .dictating { phase = .cancelled }
     }
+    var suppressesRecoveredTail: Bool {
+        phase == .pending || phase == .dictating || phase == .cancelled
+    }
+    mutating func abandonAfterVerifiedRelease() { phase = .idle }
     mutating func recoverIfReleased(_ released: Bool) {
         if released && phase == .cancelled { phase = .idle }
     }
@@ -47,6 +51,15 @@ final class FnInputTap {
     private var pressID: UInt64 = 0
     private var pressSource: FnTriggerSource = .keyboard
     private var stopped = false
+    private var started = false
+    private var finished = false
+    private var stopCompletions: [() -> Void] = []
+    private var watchdog = FnPressWatchdog()
+    private var recoveredTailSources = Set<FnTriggerSource>()
+    private var lastRecoveredID: UInt64 = 0
+    private var pendingSignals = 0
+    private var receivedDown: UInt64 = 0
+    private var receivedUp: UInt64 = 0
     private var runLoop: CFRunLoop?
     private var tap: CFMachPort?
     private var interceptedDown: CGEvent?
@@ -68,25 +81,85 @@ final class FnInputTap {
         return !stopped && pressID == expected && state.phase == .dictating
     }
     func cancelOwnedPress() { lock.lock(); state.cancel(); lock.unlock() }
-    func recoverIfReleased() {
-        // This polling happens outside the event callback, on the caller's timer.
-        let released = !CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
-        lock.lock(); state.recoverIfReleased(released); lock.unlock()
+    /// Returns only an owned, still-current press. If a real up has already
+    /// reached the worker, its queued main-thread release takes precedence.
+    func recoverIfReleased() -> UInt64? {
+        let physicalDown = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped, state.phase != .idle,
+              let candidate = watchdog.recoveryCandidate(now: now, physicalFnDown: physicalDown),
+              candidate == pressID else { return nil }
+        watchdog.end(id: candidate)
+        lastRecoveredID = candidate
+        // A chord already replayed its down to downstream listeners. Its late
+        // up must pass through so those listeners can release their own state.
+        if state.suppressesRecoveredTail { recoveredTailSources.insert(pressSource) }
+        state.abandonAfterVerifiedRelease()
+        interceptedDown = nil
+        return candidate
+    }
+
+    func wasRecovered(press expected: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return expected <= lastRecoveredID
+    }
+    var isIdle: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !stopped && state.phase == .idle
+    }
+    /// Atomically stop acquiring input only if no press or queued gesture is
+    /// active. The monitor must then call stop and wait for teardown completion.
+    func reserveForegroundRearm(physicalKeysReleased: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard physicalKeysReleased, !stopped, eligible,
+              state.phase == .idle, pendingSignals == 0 else { return false }
+        stopped = true
+        eligible = false
+        return true
+    }
+
+    var diagnosticSnapshot: [String: Any] {
+        lock.lock()
+        let currentTap = tap
+        var snapshot: [String: Any] = [
+            "filter_phase": String(describing: state.phase), "eligible": eligible,
+            "fn_down_count": receivedDown, "fn_up_count": receivedUp,
+            "stopped": stopped, "thread_finished": finished]
+        lock.unlock()
+        // Never hold the callback's lock while consulting WindowServer.
+        snapshot["tap_valid"] = currentTap.map { CFMachPortIsValid($0) } ?? false
+        snapshot["tap_enabled"] = currentTap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false
+        return snapshot
     }
 
     func start(completion: @escaping (Result<Void, Error>) -> Void) {
+        lock.lock()
+        guard !started, !stopped else {
+            lock.unlock()
+            DispatchQueue.main.async { completion(.failure(TriggerMonitorError.eventTapUnavailable)) }
+            return
+        }
+        started = true
+        lock.unlock()
         let thread = Thread { [self] in run(completion: completion) }
         thread.name = "DoubaoVoiceBridge.FnInput"
         thread.qualityOfService = .userInteractive
         thread.start()
     }
 
-    func stop() {
+    /// Completion runs on main only after the port is disabled/invalidated and
+    /// the old run loop has exited. This also handles stop-before-thread-start.
+    func stop(completion: (() -> Void)? = nil) {
         lock.lock()
         stopped = true
         eligible = false
+        if !started { finished = true }
+        let completeNow = finished
+        if let completion, !completeNow { stopCompletions.append(completion) }
         let loop = runLoop
         lock.unlock()
+        if completeNow, let completion { DispatchQueue.main.async(execute: completion) }
         if let loop {
             CFRunLoopPerformBlock(loop, CFRunLoopMode.commonModes.rawValue) { CFRunLoopStop(loop) }
             CFRunLoopWakeUp(loop)
@@ -94,6 +167,23 @@ final class FnInputTap {
     }
 
     private func run(completion: @escaping (Result<Void, Error>) -> Void) {
+        var installed: CFMachPort?
+        var source: CFRunLoopSource?
+        let loop = CFRunLoopGetCurrent()!
+        defer {
+            if let installed { CGEvent.tapEnable(tap: installed, enable: false); CFMachPortInvalidate(installed) }
+            if let source { CFRunLoopRemoveSource(loop, source, .commonModes) }
+            lock.lock()
+            runLoop = nil; tap = nil; finished = true; eligible = false
+            let callbacks = stopCompletions; stopCompletions.removeAll()
+            lock.unlock()
+            DispatchQueue.main.async { callbacks.forEach { $0() } }
+        }
+        lock.lock(); let alreadyStopped = stopped; lock.unlock()
+        guard !alreadyStopped else {
+            DispatchQueue.main.async { completion(.failure(TriggerMonitorError.eventTapUnavailable)) }
+            return
+        }
         let mask = [CGEventType.flagsChanged, .keyDown, .leftMouseDown,
                     .rightMouseDown, .otherMouseDown, .scrollWheel].reduce(CGEventMask(0)) {
             $0 | (CGEventMask(1) << CGEventMask($1.rawValue))
@@ -103,40 +193,50 @@ final class FnInputTap {
             return Unmanaged<FnInputTap>.fromOpaque(info).takeUnretainedValue()
                 .handle(proxy: proxy, type: type, event: event)
         }
-        guard let installed = CGEvent.tapCreate(
+        installed = CGEvent.tapCreate(
             tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
             eventsOfInterest: mask, callback: callback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ), let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, installed, 0) else {
+        )
+        guard let installed else {
             DispatchQueue.main.async { completion(.failure(TriggerMonitorError.eventTapUnavailable)) }
             return
         }
-        let loop = CFRunLoopGetCurrent()!
+        source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, installed, 0)
+        guard let source else {
+            DispatchQueue.main.async { completion(.failure(TriggerMonitorError.eventTapUnavailable)) }
+            return
+        }
         lock.lock()
         tap = installed
         runLoop = loop
         let shouldStop = stopped
         lock.unlock()
-        if !shouldStop {
-            CFRunLoopAddSource(loop, source, .commonModes)
-            DispatchQueue.main.async { completion(.success(())) }
-            CFRunLoopRun()
-            CFRunLoopRemoveSource(loop, source, .commonModes)
+        guard !shouldStop else {
+            DispatchQueue.main.async { completion(.failure(TriggerMonitorError.eventTapUnavailable)) }
+            return
         }
-        CGEvent.tapEnable(tap: installed, enable: false)
-        CFMachPortInvalidate(installed)
-        lock.lock(); runLoop = nil; tap = nil; lock.unlock()
+        CFRunLoopAddSource(loop, source, .commonModes)
+        DispatchQueue.main.async { completion(.success(())) }
+        CFRunLoopRun()
     }
 
     private func emit(_ signal: FnTapSignal) {
-        DispatchQueue.main.async { [onSignal] in onSignal(signal) }
+        lock.lock(); pendingSignals += 1; lock.unlock()
+        DispatchQueue.main.async { [self] in
+            lock.lock(); pendingSignals -= 1; lock.unlock()
+            onSignal(signal)
+        }
     }
 
     private func handle(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             // Fail open: never re-enable a tap that macOS disabled to unblock input.
-            if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
-            lock.lock(); stopped = true; eligible = false; state.cancel(); lock.unlock()
+            lock.lock()
+            let currentTap = tap
+            stopped = true; eligible = false; state.cancel()
+            lock.unlock()
+            if let currentTap { CGEvent.tapEnable(tap: currentTap, enable: false) }
             CFRunLoopStop(CFRunLoopGetCurrent())
             DispatchQueue.main.async { [onFault] in
                 onFault("系统停用了键盘监听，已暂停；不会自动重启监听")
@@ -151,7 +251,15 @@ final class FnInputTap {
         if stopped { lock.unlock(); return Unmanaged.passUnretained(event) }
         if let down = FnKeyPolicy.transition(type: type, keyCode: code, flags: event.flags) {
             let source = FnKeyPolicy.source(marker: event.getIntegerValueField(.eventSourceUserData))
-            if (state.phase == .pending || state.phase == .dictating || state.phase == .cancelled), source != pressSource {
+            if down { receivedDown &+= 1 } else { receivedUp &+= 1 }
+            // A late up after watchdog recovery belongs to the cancelled press.
+            // A new down from this source clears the tombstone before acquiring it.
+            if down { recoveredTailSources.remove(source) }
+            else if recoveredTailSources.remove(source) != nil {
+                lock.unlock()
+                return nil
+            }
+            if state.phase != .idle, source != pressSource {
                 // A headset pulse cannot release an owned keyboard hold, or vice versa.
                 lock.unlock()
                 return nil
@@ -162,6 +270,7 @@ final class FnInputTap {
                 if wasIdle && suppress {
                     pressID &+= 1
                     pressSource = source
+                    watchdog.begin(id: pressID, source: source, now: ProcessInfo.processInfo.systemUptime)
                     interceptedDown = event.copy()
                 }
                 let id = pressID
@@ -171,6 +280,7 @@ final class FnInputTap {
             }
             let id = pressID
             let decision = state.up()
+            watchdog.end(id: id)
             interceptedDown = nil
             lock.unlock()
             if decision.release { emit(.released(id)) }

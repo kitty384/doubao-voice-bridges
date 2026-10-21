@@ -1,0 +1,92 @@
+import Foundation
+
+enum RoutingMonitorTests {
+    static func run() -> (failures: [String], count: Int) {
+        var failures: [String] = []
+        var count = 0
+        func check(_ condition: Bool, _ name: String) {
+            count += 1
+            if !condition { failures.append(name) }
+        }
+        var keyboard = FnPressWatchdog()
+        keyboard.begin(id: 1, source: .keyboard, now: 0)
+        check(keyboard.recoveryCandidate(now: 0.05, physicalFnDown: false) == nil, "keyboard initial quiet is not release")
+        check(keyboard.recoveryCandidate(now: 0.36, physicalFnDown: false) == nil, "keyboard minimum press age")
+        check(keyboard.recoveryCandidate(now: 0.41, physicalFnDown: false) == 1, "keyboard quiet and age recover owned id")
+        keyboard.end(id: 1)
+        check(keyboard.recoveryCandidate(now: 10, physicalFnDown: false) == nil, "real release removes watchdog")
+
+        keyboard.begin(id: 2, source: .keyboard, now: 1)
+        check(keyboard.recoveryCandidate(now: 1.1, physicalFnDown: false) == nil, "first quiet sample waits")
+        check(keyboard.recoveryCandidate(now: 1.3, physicalFnDown: true) == nil, "held key resets quiet interval")
+        check(keyboard.recoveryCandidate(now: 1.5, physicalFnDown: false) == nil, "new quiet period starts")
+        check(keyboard.recoveryCandidate(now: 1.79, physicalFnDown: false) == nil, "continuous quiet required")
+        check(keyboard.recoveryCandidate(now: 1.81, physicalFnDown: false) == 2, "continuous quiet recovery")
+        keyboard.begin(id: 3, source: .keyboard, now: 2)
+        keyboard.end(id: 2)
+        check(keyboard.pressID == 3, "old completion cannot end newer press")
+        check(keyboard.recoveryCandidate(now: 50, physicalFnDown: true) == nil, "held keyboard never times out from age alone")
+
+        var headset = FnPressWatchdog()
+        headset.begin(id: 11, source: .headset, now: 3)
+        check(headset.recoveryCandidate(now: 3.6, physicalFnDown: false) == nil, "headset ignores physical released state")
+        check(headset.recoveryCandidate(now: 3.99, physicalFnDown: false) == nil, "headset waits full second")
+        check(headset.recoveryCandidate(now: 4.01, physicalFnDown: true) == 11, "headset timeout independent of physical Fn")
+        headset.end(id: 11)
+        check(headset.recoveryCandidate(now: 5, physicalFnDown: false) == nil, "headset release wins over timeout")
+        headset.begin(id: 12, source: .headset, now: 6)
+        headset.end(id: 11)
+        check(headset.pressID == 12, "old headset release does not end current pulse")
+
+        var filter = FnFilterState()
+        check(filter.down(eligible: true), "eligible first Fn claimed")
+        filter.cancel()
+        let cancelledUp = filter.up()
+        check(cancelledUp.suppress && !cancelledUp.release, "cancelled tail up swallowed without submission")
+        check(filter.phase == .idle, "cancelled natural up resets filter")
+        check(!filter.down(eligible: false), "composer Fn remains native")
+        check(filter.down(eligible: true), "new UU session becomes eligible")
+        filter.abandonAfterVerifiedRelease()
+        check(filter.phase == .idle, "verified lost up clears filter")
+        check(filter.down(eligible: true), "press after recovery accepted")
+        let release = filter.up()
+        check(release.suppress && release.release, "new press release survives old recovery")
+
+        var tail = FnFilterState()
+        _ = tail.down(eligible: true)
+        check(tail.suppressesRecoveredTail, "pending recovery suppresses late up")
+        _ = tail.chord()
+        check(!tail.suppressesRecoveredTail, "replayed chord must pass its late up")
+        tail.abandonAfterVerifiedRelease()
+        check(!tail.up().suppress, "passthrough recovery leaves downstream release intact")
+        _ = tail.down(eligible: true)
+        _ = tail.beginDictation()
+        check(tail.suppressesRecoveredTail, "dictating recovery suppresses owned late up")
+        tail.cancel()
+        check(tail.suppressesRecoveredTail, "cancelled recovery suppresses owned late up")
+
+        var rearm = FnForegroundRearmPolicy()
+        check(!rearm.enteredUU(false), "outside UU does not rearm")
+        check(rearm.enteredUU(true), "real UU entry offers one attempt")
+        check(!rearm.enteredUU(true), "duplicate activation does not rearm")
+        check(rearm.allow(now: 0), "first attempt allowed")
+        check(!rearm.allow(now: 2.99), "rearm cooldown enforced")
+        check(rearm.allow(now: 3.01), "cooldown eventually expires")
+        _ = rearm.enteredUU(false)
+        check(rearm.enteredUU(true), "later true entry eligible")
+        var handoff = FnComposerHandoffPolicy()
+        check(handoff.allowsEligibility(targetAvailable: true, now: 0), "idle foreground eligible")
+        handoff.suspend(now: 1)
+        check(!handoff.allowsEligibility(targetAvailable: true, now: 1), "synchronous refresh cannot undo handoff")
+        check(!handoff.allowsEligibility(targetAvailable: true, now: 1.10), "next timer cannot swallow second Fn")
+        check(!handoff.allowsEligibility(targetAvailable: false, now: 1.2), "composer activation stays ineligible")
+        check(handoff.allowsEligibility(targetAvailable: true, now: 1.3), "later UU return clears handoff")
+        handoff.suspend(now: 2)
+        check(!handoff.allowsEligibility(targetAvailable: true, now: 2.74), "failed handoff waits bound")
+        check(handoff.allowsEligibility(targetAvailable: true, now: 2.76), "failed handoff eventually retries normally")
+        handoff.suspend(now: 3)
+        handoff.reset()
+        check(handoff.allowsEligibility(targetAvailable: true, now: 3.1), "explicit restart clears handoff")
+        return (failures, count)
+    }
+}

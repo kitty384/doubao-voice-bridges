@@ -80,3 +80,70 @@ func isHeadphoneName(_ name: String) -> Bool {
     let lower = name.lowercased()
     return lower.contains("headphone") || lower.contains("headset") || name.contains("耳机")
 }
+
+
+/// Cooperative messages carry a request ID, target PID, timestamp and reply status.
+/// They never contain speech, input text, or clipboard data.
+enum ComposerProtocol {
+    static let requestName = "com.doubao.voicebridges.openComposer.v1"
+    static let replyName = "com.doubao.voicebridges.openComposerReply.v1"
+    static let object = "com.doubao.voicebridges.local"
+    static let uuBundleID = "com.netease.uuremote"
+    static let bridgeBundleID = "com.lyp.DoubaoVoiceBridge.Fn"
+    static let timeout: Double = 0.8
+}
+
+enum HeadsetShortcutRoute: Equatable {
+    case localFn
+    case openComposer(String)
+    case waiting
+    case bridgeUnavailable
+    case noForeground
+}
+
+enum ComposerReplyStatus: String, CaseIterable {
+    case opened, restored, busy, paused, unavailable, blocked, focusChanged
+}
+
+/// A pending request suppresses further clicks even if the first request has
+/// already moved focus. Neither timeout nor a reply can inject a fallback Fn.
+struct ComposerRoutingState {
+    private(set) var pendingID: String?
+    private var deadline: Double = 0
+
+    mutating func route(frontmostBundleID: String?, bridgeRunning: Bool,
+                        requestID: String, now: Double) -> HeadsetShortcutRoute {
+        if pendingID != nil {
+            if now < deadline { return .waiting }
+            cancel()
+        }
+        guard let foreground = frontmostBundleID, !foreground.isEmpty else { return .noForeground }
+        guard foreground == ComposerProtocol.uuBundleID else { return .localFn }
+        guard bridgeRunning else { return .bridgeUnavailable }
+        pendingID = requestID
+        deadline = now + ComposerProtocol.timeout
+        return .openComposer(requestID)
+    }
+
+    mutating func acknowledge(requestID: String, status: String,
+                              now: Double) -> ComposerReplyStatus? {
+        guard let pending = pendingID else { return nil }
+        guard now < deadline else { cancel(); return nil }
+        guard requestID == pending,
+              let reply = ComposerReplyStatus(rawValue: status) else { return nil }
+        cancel()
+        return reply
+    }
+
+    @discardableResult
+    mutating func expire(requestID: String, now: Double) -> Bool {
+        guard pendingID == requestID, now >= deadline else { return false }
+        cancel()
+        return true
+    }
+
+    mutating func cancel() {
+        pendingID = nil
+        deadline = 0
+    }
+}

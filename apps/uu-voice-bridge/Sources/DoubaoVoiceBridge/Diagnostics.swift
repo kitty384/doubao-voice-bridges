@@ -36,7 +36,7 @@ enum Diagnostics {
             ("hid_event_tap", "not_probed"),
             ("startup_state", "paused"),
             ("input_callback_thread", "dedicated"),
-            ("automatic_tap_reinstall", "disabled"),
+            ("automatic_tap_reinstall", "bounded_foreground_transition"),
             ("automatic_timeout_restart", "disabled"),
             ("doubao", FileManager.default.fileExists(atPath: doubaoPath) ? "installed" : "missing"),
             ("uuremote", uuRemote == nil ? "not_running" : "running"),

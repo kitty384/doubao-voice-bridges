@@ -2,10 +2,10 @@ import CoreGraphics
 
 /// Both the physical trigger and the local Doubao event are Fn / Globe.
 /// No preference or mapping can select a Control trigger in this build.
-enum FnTriggerSource { case keyboard, headset }
+enum FnTriggerSource: Hashable { case keyboard, headset }
 
 enum FnKeyPolicy {
-    // Installed DoubaoHeadsetBridge 1.1: HID flagsChanged Fn pulse, 60ms.
+    // DoubaoHeadsetBridge 1.1+ local Fn pulse marker (HID flagsChanged, 60ms).
     static let headsetEventMarker: Int64 = 0x444F5542414F
     static func source(marker: Int64) -> FnTriggerSource {
         marker == headsetEventMarker ? .headset : .keyboard

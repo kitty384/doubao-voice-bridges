@@ -22,14 +22,15 @@ struct PermissionStatus {
 
 enum GUIRuntimeStatus {
     static let url = FileManager.default.temporaryDirectory.appendingPathComponent("com.lyp.DoubaoVoiceBridge.Fn.gui-status.json")
-    static func write(permissions: PermissionStatus, state: String, message: String) {
-        let data: [String: Any] = [
+    static func write(permissions: PermissionStatus, state: String, message: String, details: [String: Any] = [:]) {
+        var data: [String: Any] = [
             "source": "gui_process", "pid": ProcessInfo.processInfo.processIdentifier,
             "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
             "accessibility": permissions.accessibility, "input_monitoring": permissions.inputMonitoring,
             "state": state, "message": message,
             "updated_at": ISO8601DateFormatter().string(from: Date())
         ]
+        data["monitor_details"] = details
         if let encoded = try? JSONSerialization.data(withJSONObject: data, options: [.sortedKeys]) {
             try? encoded.write(to: url, options: .atomic)
         }
