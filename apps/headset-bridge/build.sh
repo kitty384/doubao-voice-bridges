@@ -18,6 +18,7 @@ architectures=(arm64 x86_64)
 executables=()
 sources=(
   "$project_dir/Sources/MappingCore.swift"
+  "$project_dir/Sources/FnPulseEvents.swift"
   "$project_dir/Sources/AudioRoute.swift"
   "$project_dir/Sources/HeadsetCapture.swift"
   "$project_dir/Sources/main.swift"

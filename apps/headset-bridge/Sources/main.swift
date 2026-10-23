@@ -220,21 +220,16 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let current = CGEventSource.flagsState(.combinedSessionState)
         guard current.intersection([.maskCommand, .maskControl, .maskAlternate,
                                     .maskShift, .maskSecondaryFn]).isEmpty else { return }
-        let source = CGEventSource(stateID: .privateState)
-        guard let down = CGEvent(keyboardEventSource: source, virtualKey: 63, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: 63, keyDown: false) else { return }
-        down.type = .flagsChanged
-        up.type = .flagsChanged
-        down.flags = current.union(.maskSecondaryFn)
-        up.flags = current
-        down.setIntegerValueField(.eventSourceUserData, value: marker)
-        up.setIntegerValueField(.eventSourceUserData, value: marker)
+        guard let pair = FnPulseEvents.makePair() else { return }
+        let down = pair.down
+        let up = pair.up
         let latestForeground = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         if latestForeground == ComposerProtocol.uuBundleID { routeShortcut(); return }
         guard latestForeground == foreground, mappingRequested else { return }
         pendingFnUp = up
+        FnPulseEvents.prepare(down, down: true, currentFlags: current)
         down.post(tap: .cghidEventTap)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + FnPulseEvents.duration) { [weak self] in
             guard let self, self.pendingFnUp === up else { return }
             self.releaseFn()
         }
@@ -243,7 +238,8 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func releaseFn() {
         guard let up = pendingFnUp else { return }
         pendingFnUp = nil
-        up.flags = CGEventSource.flagsState(.combinedSessionState).subtracting(.maskSecondaryFn)
+        FnPulseEvents.prepare(up, down: false,
+                              currentFlags: CGEventSource.flagsState(.combinedSessionState))
         up.post(tap: .cghidEventTap)
     }
 

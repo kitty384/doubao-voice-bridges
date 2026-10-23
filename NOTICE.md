@@ -15,7 +15,7 @@
 
 ## 豆包耳机语音桥接
 
-- 当前应用版本：1.2 / build 3，由 1.1 继续修改。
+- 当前应用版本：1.2.1 / build 4，由 1.1 继续修改。
 - 原版权声明：`Copyright (c) 2026 Doubao Headset Bridge contributors`。
 - 许可证全文保留于 [apps/headset-bridge/LICENSE](apps/headset-bridge/LICENSE)。
 
@@ -24,3 +24,5 @@
 ## 第三方软件
 
 豆包语音输入法、网易 UU 远程和 macOS 是独立的第三方软件，不随本仓库分发，也不适用本仓库的 MIT 许可证。名称用于说明兼容目标，不表示其厂商参与开发、提供担保或认可本项目。
+
+1.2.1 修正耳机 Fn-down/up 在实际发布前的时间戳，添加不注入事件的对象自检。此修复没有证明豆包内部 ASR 或文字提交的失败原因，仍需实际输入验证。
