@@ -65,15 +65,88 @@ enum RoutingMonitorTests {
         tail.cancel()
         check(tail.suppressesRecoveredTail, "cancelled recovery suppresses owned late up")
 
+        // The actual delivery returns focus to UU while its target provider is
+        // still unavailable. Merely reading a candidate must not discard it.
         var rearm = FnForegroundRearmPolicy()
-        check(!rearm.enteredUU(false), "outside UU does not rearm")
-        check(rearm.enteredUU(true), "real UU entry offers one attempt")
-        check(!rearm.enteredUU(true), "duplicate activation does not rearm")
-        check(rearm.allow(now: 0), "first attempt allowed")
-        check(!rearm.allow(now: 2.99), "rearm cooldown enforced")
-        check(rearm.allow(now: 3.01), "cooldown eventually expires")
-        _ = rearm.enteredUU(false)
-        check(rearm.enteredUU(true), "later true entry eligible")
+        check(!rearm.observeForeground(false, now: 0), "outside UU does not rearm")
+        check(rearm.observeForeground(true, now: 0), "real UU entry creates pending request")
+        let entryID = rearm.pending!.id
+        check(rearm.candidate(now: 0.14) == nil, "foreground request respects earliest attempt")
+        check(rearm.candidate(now: 0.15)?.id == entryID, "busy owner can see original request")
+        check(rearm.pending?.id == entryID, "busy attempt does not discard token")
+        check(rearm.candidate(now: 0.59)?.id == entryID, "delivery busy until cleanup retains token")
+        check(rearm.deliveryDidSettle(now: 0.6), "cleanup upgrades pending request")
+        check(rearm.pending?.reason == .postDelivery, "cleanup reason recorded")
+        check(rearm.candidate(now: 0.6)?.id == entryID, "cleanup permits immediate ready attempt")
+        check(rearm.didRearm(requestID: entryID, now: 0.6), "ready reservation consumes request")
+        check(rearm.pending == nil && rearm.candidate(now: 0.7) == nil, "success consumes exactly once")
+        check(!rearm.observeForeground(true, now: 0.7), "same foreground observation is not new entry")
+        check(rearm.pending == nil, "audit after restart cannot create another token")
+        check(!rearm.deliveryDidSettle(now: 0.71), "duplicate cleanup cannot create another token")
+        check(rearm.pending == nil, "duplicate cleanup remains consumed")
+
+        // A very short subsequent compose/send cycle must not be dropped by
+        // the ordinary three-second foreground cooldown.
+        rearm.noteComposerOpening()
+        check(rearm.deliveryDidSettle(now: 0.8), "new compose cycle permits new cleanup request")
+        let fastID = rearm.pending!.id
+        check(rearm.candidate(now: 0.8) == nil, "post-delivery refresh still respects quarter-second bound")
+        check(rearm.pending?.id == fastID, "quarter-second cooldown retains request")
+        check(rearm.candidate(now: 0.86)?.id == fastID, "fast cycle can refresh before three seconds")
+        check(rearm.didRearm(requestID: fastID, now: 0.86), "fast cycle consumes once")
+        _ = rearm.observeForeground(false, now: 1)
+        check(rearm.observeForeground(true, now: 1.1), "ordinary reentry creates token")
+        let normalID = rearm.pending!.id
+        check(rearm.candidate(now: 2) == nil, "ordinary reentry retains three-second cooldown")
+        check(rearm.pending?.id == normalID, "ordinary cooldown does not drop request")
+        check(rearm.candidate(now: 3.87)?.id == normalID, "ordinary request eventually becomes ready")
+        check(rearm.didRearm(requestID: normalID, now: 3.87), "ordinary ready request consumed")
+
+        // Failed reservation/held modifiers/queued signals are caller-side
+        // guards. Without didRearm, neither token nor cooldown is consumed.
+        var reservation = FnForegroundRearmPolicy()
+        _ = reservation.observeForeground(true, now: 10)
+        let reserveID = reservation.pending!.id
+        check(reservation.candidate(now: 10.2)?.id == reserveID, "reservation candidate exists")
+        check(reservation.candidate(now: 10.21)?.id == reserveID, "failed reservation keeps candidate without cooldown")
+        check(!reservation.didRearm(requestID: reserveID + 1, now: 10.21), "stale or foreign request cannot consume token")
+        check(reservation.candidate(now: 10.22)?.id == reserveID, "failed consumption does not start cooldown")
+        check(reservation.didRearm(requestID: reserveID, now: 10.22), "actual successful reservation consumes token")
+
+        var leaving = FnForegroundRearmPolicy()
+        _ = leaving.observeForeground(true, now: 20)
+        let oldID = leaving.pending!.id
+        _ = leaving.observeForeground(false, now: 20.1)
+        check(leaving.pending == nil && leaving.candidate(now: 20.2) == nil, "leaving UU cancels pending refresh")
+        check(!leaving.deliveryDidSettle(now: 20.2), "cleanup outside UU cannot steal focus")
+        _ = leaving.observeForeground(true, now: 20.3)
+        let newID = leaving.pending!.id
+        check(newID != oldID, "later foreground entry gets distinct identity")
+        check(!leaving.didRearm(requestID: oldID, now: 20.5), "old delayed entry cannot consume new request")
+        check(leaving.candidate(now: 20.5)?.id == newID, "new entry survives stale callback")
+        leaving.cancelPending()
+        check(leaving.pending == nil, "pause or system failure cancels pending refresh")
+        check(!leaving.observeForeground(true, now: 20.6), "stop-start preserves foreground identity")
+        check(leaving.pending == nil, "internal restart cannot become periodic rearm")
+        _ = leaving.observeForeground(true, now: 20.7, requestsEnabled: false)
+        check(!leaving.deliveryDidSettle(now: 20.8) && leaving.pending == nil, "disabled monitor cannot revive from cleanup")
+
+        var expired = FnForegroundRearmPolicy()
+        _ = expired.observeForeground(true, now: 30)
+        check(expired.candidate(now: 34.99) != nil, "busy token lives for five seconds")
+        check(expired.candidate(now: 35) == nil && expired.pending == nil, "expired request is cancelled")
+        check(!expired.observeForeground(true, now: 35.1) && expired.pending == nil, "expiry does not manufacture periodic request")
+
+        var fallback = FnForegroundRearmPolicy()
+        _ = fallback.observeForeground(false, now: 40)
+        check(fallback.observeForeground(true, now: 40.1), "actual foreground sample compensates for missed notification")
+        let fallbackID = fallback.pending!.id
+        check(!fallback.observeForeground(true, now: 40.2), "later duplicate notification is idempotent")
+        check(fallback.pending?.id == fallbackID, "duplicate notification preserves original token")
+        fallback.cancelPending()
+        _ = fallback.observeForeground(true, now: 40.3, requestsEnabled: false)
+        _ = fallback.observeForeground(true, now: 40.4, requestsEnabled: true)
+        check(fallback.pending == nil, "fresh start at same foreground does not self-schedule another refresh")
         var handoff = FnComposerHandoffPolicy()
         check(handoff.allowsEligibility(targetAvailable: true, now: 0), "idle foreground eligible")
         handoff.suspend(now: 1)

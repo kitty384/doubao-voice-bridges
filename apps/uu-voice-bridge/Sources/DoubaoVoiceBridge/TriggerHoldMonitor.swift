@@ -16,10 +16,12 @@ final class TriggerHoldMonitor {
     private var pendingStart: (() -> Void)?
     private var foregroundRearm = FnForegroundRearmPolicy()
     private var foregroundIsUU = false
+    private var rearmCount: UInt64 = 0
     private var composerHandoff = FnComposerHandoffPolicy()
     private var rearmWorkItem: DispatchWorkItem?
     private let holdThreshold: TimeInterval
     private let targetProvider: () -> UURemoteTarget?
+    private let foregroundUUProvider: () -> Bool
     private let localComposerReady: () -> Bool
     private let onBegin: (UURemoteTarget, ComposerEntryMode) -> Bool
     private let onRelease: () -> Void
@@ -39,12 +41,13 @@ final class TriggerHoldMonitor {
     private(set) var activeTapLocation: CGEventTapLocation?
     var isGestureIdle: Bool { gesture.phase == .idle }
 
-    init(holdThreshold: TimeInterval, voiceHoldEnabled: Bool = false, targetProvider: @escaping () -> UURemoteTarget?,
+    init(holdThreshold: TimeInterval, voiceHoldEnabled: Bool = false, foregroundUUProvider: @escaping () -> Bool, targetProvider: @escaping () -> UURemoteTarget?,
          localComposerReady: @escaping () -> Bool, onBegin: @escaping (UURemoteTarget, ComposerEntryMode) -> Bool,
          onRelease: @escaping () -> Void, onCancel: @escaping () -> Void) {
         self.holdThreshold = min(max(holdThreshold, 0.18), 0.60)
         self.voiceHoldEnabled = voiceHoldEnabled
         self.targetProvider = targetProvider
+        self.foregroundUUProvider = foregroundUUProvider
         self.localComposerReady = localComposerReady
         self.onBegin = onBegin
         self.onRelease = onRelease
@@ -79,6 +82,11 @@ final class TriggerHoldMonitor {
             switch result {
             case .success:
                 self.activeTapLocation = .cghidEventTap
+                // A newly installed tap is already at the head. Synchronize
+                // identity without manufacturing another refresh request.
+                self.foregroundIsUU = self.foregroundUUProvider()
+                self.foregroundRearm.observeForeground(self.foregroundIsUU,
+                    now: ProcessInfo.processInfo.systemUptime, requestsEnabled: false)
                 self.refreshEligibility()
                 let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
                     self?.auditAndRefresh()
@@ -95,6 +103,9 @@ final class TriggerHoldMonitor {
         precondition(Thread.isMainThread)
         generation += 1
         pendingStart = nil
+        // Keep observed foreground identity: an internal stop/start must not
+        // appear as another UU entry and repeatedly rearm itself.
+        foregroundRearm.cancelPending()
         composerHandoff.reset()
         rearmWorkItem?.cancel(); rearmWorkItem = nil
         // Wait for the old run loop to exit before any subsequent start. A pause
@@ -125,6 +136,7 @@ final class TriggerHoldMonitor {
     func suspendEligibilityForComposer() {
         precondition(Thread.isMainThread)
         composerHandoff.suspend(now: ProcessInfo.processInfo.systemUptime)
+        foregroundRearm.noteComposerOpening()
         worker?.setEligible(false)
     }
 
@@ -136,37 +148,88 @@ final class TriggerHoldMonitor {
         snapshot["gesture_phase"] = String(describing: gesture.phase)
         snapshot["voice_hold_enabled"] = voiceHoldEnabled
         snapshot["teardown_pending"] = drainingWorker != nil
+        snapshot["rearm_pending"] = foregroundRearm.pending != nil
+        snapshot["rearm_reason"] = foregroundRearm.pending?.reason.rawValue ?? foregroundRearm.lastRearmReason?.rawValue ?? "none"
+        snapshot["rearm_count"] = rearmCount
+        snapshot["rearm_generation"] = generation
+        snapshot["rearm_observed_uu"] = foregroundIsUU
         return snapshot
     }
 
-    /// One bounded refresh on entering UU; never chase another app's tap order.
-    /// macOS-disabled taps stay paused until an explicit user action.
+    /// Preserve one foreground-entry request while delivery or keys are busy.
+    /// The common-mode audit retries only that token, never periodic tap order.
     func refreshForForegroundTransition(isUU: Bool) {
         precondition(Thread.isMainThread)
+        let now = ProcessInfo.processInfo.systemUptime
         foregroundIsUU = isUU
-        let entered = foregroundRearm.enteredUU(isUU)
+        let entered = foregroundRearm.observeForeground(isUU, now: now, requestsEnabled: worker != nil)
         if !isUU {
             rearmWorkItem?.cancel(); rearmWorkItem = nil
             composerHandoff.reset()
         }
         refreshEligibility()
-        guard entered, worker != nil else { return }
+        guard entered, let request = foregroundRearm.pending, worker != nil else { return }
         let expected = generation
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.generation == expected, self.foregroundIsUU,
-                  self.worker?.isIdle == true, self.gesture.phase == .idle,
-                  self.targetProvider() != nil, !IsSecureEventInputEnabled() else { return }
-            let flags = CGEventSource.flagsState(.hidSystemState)
-            guard flags.intersection(FnKeyPolicy.conflictingFlags.union(.maskSecondaryFn)).isEmpty,
-                  self.foregroundRearm.allow(now: ProcessInfo.processInfo.systemUptime),
-                  self.worker?.reserveForegroundRearm(physicalKeysReleased: true) == true else { return }
-            self.stop()
-            self.start { [weak self] result in
-                if case .failure(let error) = result { self?.onFault?(error.localizedDescription) }
-            }
+            guard let self, self.generation == expected,
+                  self.foregroundRearm.pending?.id == request.id else { return }
+            self.attemptPendingRearm()
         }
         rearmWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: item)
+    }
+
+    /// Called once after an actual delivery's final state and cleanup are set.
+    /// It upgrades/creates one bounded token, allowing rapid successive entries
+    /// without the ordinary foreground transition's three-second cooldown.
+    func deliveryDidSettle() {
+        precondition(Thread.isMainThread)
+        guard worker != nil else { return }
+        refreshForForegroundTransition(isUU: foregroundUUProvider())
+        let now = ProcessInfo.processInfo.systemUptime
+        guard foregroundRearm.deliveryDidSettle(now: now) else { return }
+        refreshEligibility()
+        attemptPendingRearm()
+    }
+
+    private func attemptPendingRearm() {
+        precondition(Thread.isMainThread)
+        // Foreground identity is independent of targetProvider: delivering
+        // temporarily makes that provider nil while UU is still foreground.
+        guard foregroundUUProvider() else {
+            if foregroundIsUU { refreshForForegroundTransition(isUU: false) }
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let request = foregroundRearm.candidate(now: now),
+              let input = worker, input.isIdle, gesture.phase == .idle,
+              targetProvider() != nil, !IsSecureEventInputEnabled() else { return }
+        let flags = CGEventSource.flagsState(.hidSystemState)
+        let combinedFlags = CGEventSource.flagsState(.combinedSessionState)
+        let modifiers = FnKeyPolicy.conflictingFlags.union(.maskSecondaryFn)
+        guard flags.intersection(modifiers).isEmpty,
+              combinedFlags.intersection(modifiers).isEmpty else { return }
+        // WindowServer queries can be delayed. Recheck focus and the deadline
+        // AFTER those queries, before the atomic reservation stops acquiring input.
+        guard foregroundUUProvider() else {
+            refreshForForegroundTransition(isUU: false)
+            return
+        }
+        let commitNow = ProcessInfo.processInfo.systemUptime
+        guard foregroundRearm.candidate(now: commitNow)?.id == request.id,
+              input.reserveForegroundRearm(physicalKeysReleased: true) else { return }
+        // There is no main-thread interleaving between reservation and token
+        // consumption. If invariants ever fail, finish teardown and stay paused.
+        guard foregroundRearm.didRearm(requestID: request.id, now: commitNow) else {
+            stop()
+            onFault?("监听刷新状态改变，已安全暂停，请手动重新启用")
+            return
+        }
+        rearmCount &+= 1
+        stop()
+        start { [weak self] result in
+            if case .failure(let error) = result { self?.onFault?(error.localizedDescription) }
+        }
     }
 
     private func handle(_ signal: FnTapSignal) {
@@ -283,6 +346,12 @@ final class TriggerHoldMonitor {
     }
 
     private func auditAndRefresh() {
+        let actualForeground = foregroundUUProvider()
+        if actualForeground != foregroundIsUU {
+            // Compensate for delayed/missed activation notifications.
+            refreshForForegroundTransition(isUU: actualForeground)
+        }
+        foregroundRearm.expire(now: ProcessInfo.processInfo.systemUptime)
         if let recoveredID = worker?.recoverIfReleased(), activePressID == recoveredID {
             // Recovery abandons this exact press; it must never submit text or
             // cancel a newer gesture whose down was already queued on main.
@@ -294,6 +363,7 @@ final class TriggerHoldMonitor {
             cancelOwned()
         }
         refreshEligibility()
+        attemptPendingRearm()
     }
 
     private func cancelOwned() { worker?.cancelOwnedPress(); reset(notifyCancel: true) }

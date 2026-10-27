@@ -66,6 +66,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.setStatus(text, isError: isError)
         }
         configureMonitor()
+        coordinator.onDeliverySettled = { [weak self] in
+            guard let self, self.monitoringState == .active else { return }
+            self.monitor?.deliveryDidSettle()
+        }
         requestServer.onRequest = { [weak self] request, reply in
             guard let self else { reply("unavailable"); return }
             self.handleHeadsetRequest(request, reply: reply)
@@ -107,6 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let monitor = TriggerHoldMonitor(
             holdThreshold: UserDefaults.standard.double(forKey: "fnHoldThreshold"),
             voiceHoldEnabled: UserDefaults.standard.bool(forKey: "legacyHoldToTalk"),
+            foregroundUUProvider: { [weak self] in self?.currentUURemoteTarget() != nil },
             targetProvider: { [weak self] in
                 guard let self, self.monitoringState == .active,
                       self.coordinator.canRequestComposer else { return nil }
@@ -293,6 +298,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var details = monitor?.diagnosticSnapshot ?? [:]
         details.merge(coordinator.diagnosticSnapshot) { _, new in new }
         details["frontmost_is_uu"] = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.uuRemoteBundleIdentifier
+        let modifierMask = FnKeyPolicy.conflictingFlags.union(.maskSecondaryFn)
+        details["physical_modifier_flags"] = CGEventSource.flagsState(.hidSystemState).intersection(modifierMask).rawValue
+        details["session_modifier_flags"] = CGEventSource.flagsState(.combinedSessionState).intersection(modifierMask).rawValue
         GUIRuntimeStatus.write(permissions: permissions, state: state, message: statusText, details: details)
     }
 

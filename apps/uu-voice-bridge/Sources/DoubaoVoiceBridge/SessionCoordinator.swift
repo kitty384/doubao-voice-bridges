@@ -10,6 +10,7 @@ final class SessionCoordinator {
     }
 
     var onStatusChange: ((String, Bool) -> Void)?
+    var onDeliverySettled: (() -> Void)?
 
     private let panel = ComposerPanelController()
     private let delivery = UURemoteDelivery()
@@ -126,6 +127,9 @@ final class SessionCoordinator {
                     self.state = .idle
                     self.onStatusChange?("监听已启用 · UU 中按 Fn 开框，框内听写 · \(FnKeyPolicy.title)", false)
                 }
+                // Returning to UU happened while this session was busy. Give
+                // its deferred listener refresh a chance only after cleanup.
+                self.onDeliverySettled?()
             }
         )
     }

@@ -31,19 +31,87 @@ struct FnPressWatchdog {
     }
 }
 
-/// At most one attempt per real foreground entry. Failed eligibility is not
-/// retried, and even separate entries are spaced apart.
+/// One request is retained across temporary ineligibility. Expiry, leaving UU,
+/// pause and system failure cancel it; successful refresh consumes it exactly once.
 struct FnForegroundRearmPolicy {
-    private var wasUU = false
-    private var lastRearm: TimeInterval?
-    mutating func enteredUU(_ isUU: Bool) -> Bool {
-        defer { wasUU = isUU }
-        return isUU && !wasUU
+    enum Reason: String { case foregroundEntry = "foreground_entry", postDelivery = "post_delivery" }
+    struct Request {
+        let id: UInt64
+        var reason: Reason
+        var notBefore: TimeInterval
+        var expiresAt: TimeInterval
     }
-    mutating func allow(now: TimeInterval) -> Bool {
-        if let lastRearm, now - lastRearm < 3.0 { return false }
-        lastRearm = now
+    private(set) var isUU = false
+    private(set) var pending: Request?
+    private(set) var lastRearmReason: Reason?
+    private var sequence: UInt64 = 0
+    private var lastRearm: TimeInterval?
+    private var postDeliveryIssuedThisEntry = false
+    private var requestsEnabled = false
+
+    /// This also reconciles a missed notification with the actual foreground.
+    /// Paused/starting monitors may observe identity without creating a request.
+    @discardableResult
+    mutating func observeForeground(_ value: Bool, now: TimeInterval, requestsEnabled: Bool = true) -> Bool {
+        expire(now: now)
+        self.requestsEnabled = requestsEnabled
+        let entered = value && !isUU
+        isUU = value
+        if !value {
+            pending = nil
+            postDeliveryIssuedThisEntry = false
+        } else if entered {
+            postDeliveryIssuedThisEntry = false
+            if requestsEnabled { create(reason: .foregroundEntry, now: now, delay: 0.15) }
+        }
+        if !requestsEnabled { pending = nil }
+        return entered
+    }
+
+    /// A new local composer session can be shorter than a polling tick. Record
+    /// it explicitly so a later genuine delivery can request one fresh refresh.
+    mutating func noteComposerOpening() { postDeliveryIssuedThisEntry = false }
+
+    @discardableResult
+    mutating func deliveryDidSettle(now: TimeInterval) -> Bool {
+        expire(now: now)
+        guard requestsEnabled, isUU, !postDeliveryIssuedThisEntry else { return false }
+        postDeliveryIssuedThisEntry = true
+        if var request = pending {
+            request.reason = .postDelivery
+            request.notBefore = now
+            request.expiresAt = now + 5
+            pending = request
+        } else { create(reason: .postDelivery, now: now, delay: 0) }
         return true
+    }
+
+    mutating func candidate(now: TimeInterval) -> Request? {
+        expire(now: now)
+        guard requestsEnabled, isUU, let request = pending, now >= request.notBefore else { return nil }
+        let interval = request.reason == .postDelivery ? 0.25 : 3.0
+        guard lastRearm.map({ now - $0 >= interval }) ?? true else { return nil }
+        return request
+    }
+
+    /// Call only after the worker atomically reserves its idle state. A failed
+    /// reservation must not consume a token or start the cooldown.
+    @discardableResult
+    mutating func didRearm(requestID: UInt64, now: TimeInterval) -> Bool {
+        guard let request = candidate(now: now), request.id == requestID else { return false }
+        lastRearm = now
+        lastRearmReason = request.reason
+        pending = nil
+        return true
+    }
+
+    mutating func cancelPending() { pending = nil }
+    mutating func expire(now: TimeInterval) {
+        if let request = pending, now >= request.expiresAt { pending = nil }
+    }
+    private mutating func create(reason: Reason, now: TimeInterval, delay: TimeInterval) {
+        sequence &+= 1
+        pending = Request(id: sequence, reason: reason, notBefore: now + delay, expiresAt: now + 5)
     }
 }
 
