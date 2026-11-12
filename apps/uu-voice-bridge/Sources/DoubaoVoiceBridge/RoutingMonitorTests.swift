@@ -161,6 +161,52 @@ enum RoutingMonitorTests {
         _ = rearm.observeForeground(false, now: 4.3)
         check(!rearm.requestMissedPressRefresh(now: 4.3), "background listener cannot recover from physical observations")
 
+        // A replacement can keep the same process and only change the tap ID.
+        // The list's order is irrelevant; removals and re-enables are inert.
+        var peers = PeerFnTapRecoveryPolicy()
+        let oldPeer = PeerFnTapRecoveryPolicy.Identity(process: 10, tapID: 101)
+        let replacement = PeerFnTapRecoveryPolicy.Identity(process: 10, tapID: 102)
+        let anotherPeer = PeerFnTapRecoveryPolicy.Identity(process: 20, tapID: 201)
+        check(peers.sampleVisit == nil, "background never samples peer taps")
+        peers.observeForeground(true)
+        let peerVisit = peers.sampleVisit!
+        check(!peers.observe(nil, visit: peerVisit), "failed snapshot is not a baseline")
+        check(!peers.observe([oldPeer], visit: peerVisit), "first complete peer snapshot does not request refresh")
+        check(!peers.observe([oldPeer], visit: peerVisit), "unchanged peer IDs do not request refresh")
+        check(!peers.observe([], visit: peerVisit), "peer removals do not request refresh")
+        check(!peers.observe([oldPeer], visit: peerVisit), "re-enabling the same peer is not a new registration")
+        peers.observeForeground(true)
+        check(peers.sampleVisit == peerVisit, "same UU foreground keeps the peer baseline")
+        check(peers.observe([replacement], visit: peerVisit), "new tap ID in same process requests one refresh")
+        check(peers.sampleVisit == nil, "refresh budget stops probing for this visit")
+        check(!peers.observe([anotherPeer], visit: peerVisit), "subsequent additions cannot chase new taps")
+        peers.observeForeground(false)
+        check(!peers.observe([anotherPeer], visit: peerVisit), "leaving UU discards asynchronous peer result")
+        peers.observeForeground(true)
+        let laterPeerVisit = peers.sampleVisit!
+        check(laterPeerVisit != peerVisit, "returning to UU creates a different peer visit")
+        check(!peers.observe([anotherPeer], visit: peerVisit), "old foreground result cannot seed next baseline")
+        check(!peers.observe([], visit: laterPeerVisit), "empty list is a valid first snapshot")
+        check(peers.observe([anotherPeer], visit: laterPeerVisit), "real addition in the later visit is eligible")
+
+        var peerRearm = FnForegroundRearmPolicy()
+        check(!peerRearm.requestPeerTapRefresh(now: 5), "peer change cannot enable a paused monitor")
+        _ = peerRearm.observeForeground(true, now: 5)
+        let existing = peerRearm.pending!
+        check(!peerRearm.requestPeerTapRefresh(now: 5.01), "existing foreground request also covers peer change")
+        check(peerRearm.pending?.id == existing.id && peerRearm.pending?.reason == .foregroundEntry &&
+              peerRearm.pending?.expiresAt == existing.expiresAt, "coalescing does not replace or extend foreground token")
+        check(peerRearm.didRearm(requestID: existing.id, now: 5.2), "foreground token consumed")
+        check(peerRearm.requestPeerTapRefresh(now: 5.21), "uncovered peer change requests a bounded refresh")
+        let peerID = peerRearm.pending!.id
+        check(peerRearm.pending?.reason == .peerTapChanged, "peer refresh reason is visible")
+        check(peerRearm.candidate(now: 5.94) == nil, "peer refresh respects minimum 0.75-second cooldown")
+        check(peerRearm.candidate(now: 5.96)?.id == peerID, "peer refresh need not wait three seconds")
+        _ = peerRearm.observeForeground(false, now: 5.97)
+        check(peerRearm.candidate(now: 5.98) == nil, "leaving UU cancels pending peer refresh")
+        _ = peerRearm.observeForeground(true, now: 6, requestsEnabled: false)
+        check(!peerRearm.requestPeerTapRefresh(now: 6), "late peer change cannot revive disabled monitor")
+
         // Failed reservation/held modifiers/queued signals are caller-side
         // guards. Without didRearm, neither token nor cooldown is consumed.
         var reservation = FnForegroundRearmPolicy()

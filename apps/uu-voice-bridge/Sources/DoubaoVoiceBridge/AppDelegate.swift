@@ -39,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let logger = Logger(subsystem: "com.lyp.DoubaoVoiceBridge.Fn", category: "app")
     private let coordinator = SessionCoordinator()
     private let requestServer = ComposerRequestServer()
+    private let composerShortcut = ComposerShortcut()
     private var workspaceObserver: NSObjectProtocol?
     private var healthTimer: Timer?
     private var monitor: TriggerHoldMonitor?
@@ -50,13 +51,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var manualComposerSession = false
     private var accessibilityItem: NSMenuItem?
     private var inputMonitoringItem: NSMenuItem?
+    private var composerShortcutItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [
             "pasteDelay": UURemoteDelivery.defaultPasteDelay,
             "autoPasteUU": true,
             "fnHoldThreshold": 0.18,
-            "legacyHoldToTalk": false
+            "legacyHoldToTalk": false,
+            "backupComposerShortcutEnabled": true
         ])
         UserDefaults.standard.set(true, forKey: "autoPasteUU")
         migrateLatencyDefaultsIfNeeded()
@@ -76,6 +79,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.setStatus(prefix + text, isError: isError)
         }
         configureMonitor()
+        composerShortcut.canDeliver = { [weak self] in self?.shouldRegisterComposerShortcut == true }
+        composerShortcut.onReleased = { [weak self] in
+            guard let self, self.shouldRegisterComposerShortcut else { return }
+            self.openComposerFromMenu()
+        }
         coordinator.onDeliverySettled = { [weak self] in
             guard let self, self.monitoringState == .active else { return }
             self.monitor?.deliveryDidSettle()
@@ -90,6 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ) { [weak self] note in
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             self?.monitor?.refreshForForegroundTransition(isUU: app?.bundleIdentifier == Self.uuRemoteBundleIdentifier)
+            self?.updateComposerShortcut()
         }
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.updatePermissionDisplay() }
         healthTimer = timer
@@ -109,8 +118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard CGGetEventTapList(capacity, buffer, &filled) == .success else { exit(1) }
                 let ownPID = ProcessInfo.processInfo.processIdentifier
                 let ownCount = (0..<min(Int(filled), Int(capacity))).filter { buffer[$0].tappingProcess == ownPID }.count
-                guard self.monitoringState == .paused, self.monitor?.activeTapLocation == nil, ownCount == 0 else { exit(1) }
-                print("PAUSED_STARTUP_OK own_event_taps=0")
+                guard self.monitoringState == .paused, self.monitor?.activeTapLocation == nil, ownCount == 0,
+                      !self.composerShortcut.isRegistered else { exit(1) }
+                print("PAUSED_STARTUP_OK own_event_taps=0 backup_shortcut=inactive")
                 fflush(stdout)
                 NSApp.terminate(nil)
             }
@@ -154,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let workspaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver) }
         startGeneration &+= 1
         monitoringState = .paused
+        composerShortcut.setActive(false)
         monitor?.stop()
         coordinator.prepareForTermination()
         GUIRuntimeStatus.removeOwnSnapshot()
@@ -218,6 +229,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         open.target = self
         open.isEnabled = monitoringState != .starting
         menu.addItem(open)
+        let backup = NSMenuItem(title: "备用开框快捷键：\(ComposerShortcut.displayName)",
+                                action: #selector(toggleComposerShortcut), keyEquivalent: "")
+        backup.target = self
+        composerShortcutItem = backup
+        menu.addItem(backup)
         menu.addItem(.separator())
 
         let instruction = NSMenuItem(title: "UU 中第一次 Fn / 线控开框，框内再听写", action: nil, keyEquivalent: "")
@@ -302,7 +318,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) { updatePermissionDisplay() }
 
+    private var shouldRegisterComposerShortcut: Bool {
+        monitoringState == .active && UserDefaults.standard.bool(forKey: "backupComposerShortcutEnabled") &&
+            coordinator.canRequestComposer && currentUURemoteTarget() != nil &&
+            AXIsProcessTrusted() && !IsSecureEventInputEnabled()
+    }
+
+    private func updateComposerShortcut() {
+        composerShortcut.setActive(shouldRegisterComposerShortcut)
+        composerShortcutItem?.state = UserDefaults.standard.bool(forKey: "backupComposerShortcutEnabled") ? .on : .off
+        let suffix = composerShortcut.registrationError == nil ? "" : "（注册失败，可用菜单开框）"
+        composerShortcutItem?.title = "备用开框快捷键：\(ComposerShortcut.displayName)" + suffix
+    }
+
+    @objc private func toggleComposerShortcut() {
+        let defaults = UserDefaults.standard
+        defaults.set(!defaults.bool(forKey: "backupComposerShortcutEnabled"), forKey: "backupComposerShortcutEnabled")
+        updatePermissionDisplay()
+    }
+
     private func updatePermissionDisplay() {
+        updateComposerShortcut()
         let permissions = PermissionStatus.current()
         accessibilityItem?.title = "辅助功能：\(permissions.accessibility ? "已生效" : "未生效") · 打开设置…"
         inputMonitoringItem?.title = "输入监控：\(permissions.inputMonitoring ? "已生效" : "未生效") · 打开设置…"
@@ -315,6 +351,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var details = monitor?.diagnosticSnapshot ?? [:]
         details.merge(coordinator.diagnosticSnapshot) { _, new in new }
         details["frontmost_is_uu"] = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.uuRemoteBundleIdentifier
+        details["backup_shortcut_enabled"] = UserDefaults.standard.bool(forKey: "backupComposerShortcutEnabled")
+        details["backup_shortcut_registered"] = composerShortcut.isRegistered
+        if let error = composerShortcut.registrationError { details["backup_shortcut_error"] = error }
         let modifierMask = FnKeyPolicy.conflictingFlags.union(.maskSecondaryFn)
         details["physical_modifier_flags"] = CGEventSource.flagsState(.hidSystemState).intersection(modifierMask).rawValue
         details["session_modifier_flags"] = CGEventSource.flagsState(.combinedSessionState).intersection(modifierMask).rawValue

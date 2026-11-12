@@ -20,6 +20,11 @@ final class TriggerHoldMonitor {
     private var missedFn = FnMissRecoveryPolicy()
     private var pendingMissDownCount: UInt64?
     private var missedPressRefreshCount: UInt64 = 0
+    private var peerTapRecovery = PeerFnTapRecoveryPolicy()
+    private var peerTapRefreshCount: UInt64 = 0
+    private let peerTapProbeQueue = DispatchQueue(label: "com.lyp.DoubaoVoiceBridge.peer-tap-probe", qos: .utility)
+    private var peerTapProbeInFlight = false
+    private var nextPeerTapProbeAt: TimeInterval = 0
     private var composerHandoff = FnComposerHandoffPolicy()
     private var rearmWorkItem: DispatchWorkItem?
     private let holdThreshold: TimeInterval
@@ -113,7 +118,12 @@ final class TriggerHoldMonitor {
         foregroundRearm.cancelPending()
         pendingMissDownCount = nil
         if preservingMissRecoveryVisit { missedFn.dropObservation() }
-        else { missedFn.resetVisit() }
+        else {
+            missedFn.resetVisit()
+            peerTapRecovery.observeForeground(false)
+        }
+        // Never clear the in-flight flag here: a delayed old query must finish
+        // before a new generation can dispatch another WindowServer query.
         composerHandoff.reset()
         rearmWorkItem?.cancel(); rearmWorkItem = nil
         // Wait for the old run loop to exit before any subsequent start. A pause
@@ -181,6 +191,7 @@ final class TriggerHoldMonitor {
         snapshot["rearm_reason"] = foregroundRearm.pending?.reason.rawValue ?? foregroundRearm.lastRearmReason?.rawValue ?? "none"
         snapshot["rearm_count"] = rearmCount
         snapshot["missed_press_refresh_count"] = missedPressRefreshCount
+        snapshot["peer_tap_refresh_count"] = peerTapRefreshCount
         snapshot["rearm_generation"] = generation
         snapshot["rearm_observed_uu"] = foregroundIsUU
         return snapshot
@@ -197,7 +208,10 @@ final class TriggerHoldMonitor {
             rearmWorkItem?.cancel(); rearmWorkItem = nil
             composerHandoff.reset()
             // A queued notification is not proof of a real foreground leave.
-            if !foregroundUUProvider() { resetMissedFnVisit() }
+            if !foregroundUUProvider() {
+                resetMissedFnVisit()
+                peerTapRecovery.observeForeground(false)
+            }
         }
         refreshEligibility()
         guard entered, let request = foregroundRearm.pending, worker != nil else { return }
@@ -245,6 +259,11 @@ final class TriggerHoldMonitor {
                 return
             }
         }
+        if request.reason == .peerTapChanged && (!PermissionStatus.current().ready || !input.isTapOperational) {
+            // A peer change cannot revive a tap macOS disabled.
+            foregroundRearm.cancelPending()
+            return
+        }
         let flags = CGEventSource.flagsState(.hidSystemState)
         let combinedFlags = CGEventSource.flagsState(.combinedSessionState)
         let modifiers = FnKeyPolicy.conflictingFlags.union(.maskSecondaryFn)
@@ -274,6 +293,7 @@ final class TriggerHoldMonitor {
         }
         rearmCount &+= 1
         if request.reason == .missedPress { missedPressRefreshCount &+= 1 }
+        if request.reason == .peerTapChanged { peerTapRefreshCount &+= 1 }
         stop(preservingMissRecoveryVisit: true)
         start { [weak self] result in
             if case .failure(let error) = result { self?.onFault?(error.localizedDescription) }
@@ -416,6 +436,43 @@ final class TriggerHoldMonitor {
         refreshEligibility()
         observeMissedFn(actualForeground: actualForeground, physicalFlags: physicalFlags, now: now)
         attemptPendingRearm()
+        samplePeerTapsIfNeeded(actualForeground: actualForeground)
+    }
+
+    private func samplePeerTapsIfNeeded(actualForeground: Bool) {
+        peerTapRecovery.observeForeground(actualForeground)
+        guard let visit = peerTapRecovery.sampleVisit,
+              !peerTapProbeInFlight, activeTapLocation == .cghidEventTap,
+              gesture.phase == .idle, worker?.idleEligibleDownCount != nil,
+              foregroundUUProvider(), !IsSecureEventInputEnabled() else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= nextPeerTapProbeAt else { return }
+        peerTapProbeInFlight = true
+        nextPeerTapProbeAt = now + 1.0
+        let expectedGeneration = generation
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        peerTapProbeQueue.async { [weak self] in
+            let peers = PeerFnTapProbe.activePeerIDs(excluding: ownPID)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.peerTapProbeInFlight = false
+                guard self.generation == expectedGeneration,
+                      self.peerTapRecovery.sampleVisit == visit,
+                      self.activeTapLocation == .cghidEventTap,
+                      self.gesture.phase == .idle, self.worker?.idleEligibleDownCount != nil,
+                      self.foregroundUUProvider(), !IsSecureEventInputEnabled() else { return }
+                let completedAt = ProcessInfo.processInfo.systemUptime
+                guard completedAt - now <= 2,
+                      self.peerTapRecovery.observe(peers, visit: visit) else { return }
+                // The list does not establish order or prove a swallowed Fn.
+                // A newly registered filter is only a reason to request one
+                // bounded refresh; a request already pending can cover it.
+                self.foregroundRearm.observeForeground(true, now: completedAt, requestsEnabled: true)
+                if self.foregroundRearm.requestPeerTapRefresh(now: completedAt) {
+                    self.attemptPendingRearm()
+                }
+            }
+        }
     }
 
     private func observeMissedFn(actualForeground: Bool, physicalFlags: CGEventFlags, now: TimeInterval) {

@@ -99,11 +99,54 @@ struct FnMissRecoveryPolicy {
     }
 }
 
+/// Track new peer identities without assuming CGGetEventTapList reports order.
+/// Re-enabling a previously seen tap is not proof of a new insertion.
+struct PeerFnTapRecoveryPolicy {
+    struct Identity: Hashable {
+        let process: Int32
+        let tapID: UInt32
+    }
+
+    private var nextVisit: UInt64 = 0
+    private var currentVisit: UInt64?
+    private var baseline: Set<Identity>?
+    private var issuedThisVisit = false
+
+    var sampleVisit: UInt64? { issuedThisVisit ? nil : currentVisit }
+
+    mutating func observeForeground(_ isUU: Bool) {
+        guard isUU else {
+            currentVisit = nil
+            baseline = nil
+            issuedThisVisit = false
+            return
+        }
+        if currentVisit == nil {
+            nextVisit &+= 1
+            currentVisit = nextVisit
+        }
+    }
+
+    /// `nil` means the snapshot was unavailable or incomplete. Never learn
+    /// from a partial snapshot or one delivered after a different UU visit.
+    mutating func observe(_ peers: Set<Identity>?, visit: UInt64) -> Bool {
+        guard sampleVisit == visit, let peers else { return false }
+        guard let baseline else {
+            self.baseline = peers
+            return false
+        }
+        guard !peers.isSubset(of: baseline) else { return false }
+        issuedThisVisit = true
+        return true
+    }
+}
+
 /// One request is retained across temporary ineligibility. Expiry, leaving UU,
 /// pause and system failure cancel it; successful refresh consumes it exactly once.
 struct FnForegroundRearmPolicy {
     enum Reason: String {
         case foregroundEntry = "foreground_entry", postDelivery = "post_delivery", missedPress = "missed_press"
+        case peerTapChanged = "peer_tap_changed"
     }
     struct Request {
         let id: UInt64
@@ -160,6 +203,16 @@ struct FnForegroundRearmPolicy {
         return true
     }
 
+    /// A foreground/delivery/miss refresh already pending can cover the peer
+    /// change too. Do not replace it, extend its lifetime or alter its cooldown.
+    @discardableResult
+    mutating func requestPeerTapRefresh(now: TimeInterval) -> Bool {
+        expire(now: now)
+        guard requestsEnabled, isUU, pending == nil else { return false }
+        create(reason: .peerTapChanged, now: now, delay: 0)
+        return true
+    }
+
     private mutating func requestImmediateRefresh(reason: Reason, now: TimeInterval) {
         if var request = pending {
             request.reason = reason
@@ -172,7 +225,12 @@ struct FnForegroundRearmPolicy {
     mutating func candidate(now: TimeInterval) -> Request? {
         expire(now: now)
         guard requestsEnabled, isUU, let request = pending, now >= request.notBefore else { return nil }
-        let interval = request.reason == .foregroundEntry ? 3.0 : 0.25
+        let interval: TimeInterval
+        switch request.reason {
+        case .foregroundEntry: interval = 3.0
+        case .postDelivery, .missedPress: interval = 0.25
+        case .peerTapChanged: interval = 0.75
+        }
         guard lastRearm.map({ now - $0 >= interval }) ?? true else { return nil }
         return request
     }
