@@ -83,12 +83,10 @@ final class FnInputTap {
     func cancelOwnedPress() { lock.lock(); state.cancel(); lock.unlock() }
     /// Returns only an owned, still-current press. If a real up has already
     /// reached the worker, its queued main-thread release takes precedence.
-    func recoverIfReleased() -> UInt64? {
-        let physicalDown = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
-        let now = ProcessInfo.processInfo.systemUptime
+    func recoverIfReleased(physicalFnDown: Bool, now: TimeInterval) -> UInt64? {
         lock.lock(); defer { lock.unlock() }
         guard !stopped, state.phase != .idle,
-              let candidate = watchdog.recoveryCandidate(now: now, physicalFnDown: physicalDown),
+              let candidate = watchdog.recoveryCandidate(now: now, physicalFnDown: physicalFnDown),
               candidate == pressID else { return nil }
         watchdog.end(id: candidate)
         lastRecoveredID = candidate
@@ -108,12 +106,37 @@ final class FnInputTap {
         lock.lock(); defer { lock.unlock() }
         return !stopped && state.phase == .idle
     }
+
+    /// Lightweight snapshot for the audit timer; never calls WindowServer.
+    var idleEligibleDownCount: UInt64? {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped, eligible, tap != nil, state.phase == .idle, pendingSignals == 0 else { return nil }
+        return receivedDown
+    }
+
+    /// Consult WindowServer outside the callback's lock, only before a recovery.
+    var isTapOperational: Bool {
+        lock.lock(); let installed = stopped ? nil : tap; lock.unlock()
+        guard let installed, CFMachPortIsValid(installed) else { return false }
+        return CGEvent.tapIsEnabled(tap: installed)
+    }
+
+    /// Prevent a direct composer request and a concurrently delivered Fn from
+    /// each acquiring the next session. An already queued gesture takes priority.
+    func suspendForDirectComposer() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped, state.phase == .idle, pendingSignals == 0 else { return false }
+        eligible = false
+        return true
+    }
+
     /// Atomically stop acquiring input only if no press or queued gesture is
     /// active. The monitor must then call stop and wait for teardown completion.
-    func reserveForegroundRearm(physicalKeysReleased: Bool) -> Bool {
+    func reserveForegroundRearm(physicalKeysReleased: Bool, expectedDownCount: UInt64? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard physicalKeysReleased, !stopped, eligible,
-              state.phase == .idle, pendingSignals == 0 else { return false }
+              state.phase == .idle, pendingSignals == 0,
+              expectedDownCount.map({ $0 == receivedDown }) ?? true else { return false }
         stopped = true
         eligible = false
         return true

@@ -47,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusIsError = false
     private var monitoringState: MonitoringState = .paused
     private var startGeneration: UInt64 = 0
+    private var manualComposerSession = false
     private var accessibilityItem: NSMenuItem?
     private var inputMonitoringItem: NSMenuItem?
 
@@ -62,8 +63,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         configureStatusItem()
         coordinator.onStatusChange = { [weak self] text, isError in
-            guard let self, self.monitoringState == .active else { return }
-            self.setStatus(text, isError: isError)
+            guard let self, self.monitoringState == .active ||
+                    (self.monitoringState == .paused && self.manualComposerSession) else { return }
+            if self.coordinator.state == .idle {
+                self.manualComposerSession = false
+                if self.monitoringState == .paused {
+                    self.setStatus("Fn 监听暂停 · 可从菜单打开 UU 听写框", isError: false)
+                    return
+                }
+            }
+            let prefix = self.monitoringState == .paused ? "Fn 监听暂停 · " : ""
+            self.setStatus(prefix + text, isError: isError)
         }
         configureMonitor()
         coordinator.onDeliverySettled = { [weak self] in
@@ -203,6 +213,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pause.target = self
         pause.isEnabled = monitoringState != .paused
         menu.addItem(pause)
+
+        let open = NSMenuItem(title: "打开 UU 听写框", action: #selector(openComposerFromMenu), keyEquivalent: "")
+        open.target = self
+        open.isEnabled = monitoringState != .starting
+        menu.addItem(open)
         menu.addItem(.separator())
 
         let instruction = NSMenuItem(title: "UU 中第一次 Fn / 线控开框，框内再听写", action: nil, keyEquivalent: "")
@@ -252,6 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         startGeneration &+= 1
         let requestedGeneration = startGeneration
+        manualComposerSession = false
         monitoringState = .starting
         setStatus("正在启用 Fn 听写…", isError: false)
         monitor.start { [weak self] result in
@@ -275,6 +291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func pauseMonitoring(status: String, isError: Bool) {
         startGeneration &+= 1
+        manualComposerSession = false
         monitoringState = .paused
         monitor?.stop()
         coordinator.cancel(restoreFocus: false)
@@ -312,6 +329,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
+    @objc private func openComposerFromMenu() {
+        guard monitoringState != .starting else { return }
+        guard let target = currentUURemoteTarget() else {
+            setStatus("请先点进正在控制的 UU 窗口，再打开听写框", isError: true)
+            return
+        }
+        guard AXIsProcessTrusted(), !IsSecureEventInputEnabled() else {
+            setStatus("打开听写框需要辅助功能权限，并且不能处于安全输入中", isError: true)
+            return
+        }
+        guard monitor?.isGestureIdle != false, coordinator.canRequestComposer else {
+            setStatus("上一轮正在处理，请松开 Fn 或等待发送完成后再开框", isError: true)
+            return
+        }
+        guard target.captureFocusedWindow() else {
+            setStatus("未能确认 UU 窗口，请点进远端输入位置再试", isError: true)
+            return
+        }
+        let previousManualSession = manualComposerSession
+        manualComposerSession = monitoringState == .paused
+        let isStillSafe = {
+            !IsSecureEventInputEnabled() && self.currentUURemoteTarget()?.processIdentifier == target.processIdentifier
+        }
+        guard isStillSafe() else {
+            manualComposerSession = previousManualSession
+            setStatus("前台窗口已变化，请回到 UU 后重试", isError: true)
+            return
+        }
+        guard monitor?.suspendEligibilityForDirectComposer() != false else {
+            manualComposerSession = previousManualSession
+            setStatus("请先松开 Fn，再从菜单打开听写框", isError: true)
+            return
+        }
+        if !coordinator.begin(target: target, mode: .tapToCompose, activationAllowed: isStillSafe) {
+            manualComposerSession = previousManualSession
+            monitor?.resumeEligibilityAfterRejectedComposer()
+            if !isStillSafe() { setStatus("前台窗口已变化，请回到 UU 后重试", isError: true) }
+        }
+    }
+
     private func handleHeadsetRequest(_ request: ComposerOpenRequest, reply: @escaping (String) -> Void) {
         guard monitoringState == .active, let monitor else { reply("paused"); return }
         guard !IsSecureEventInputEnabled(), PermissionStatus.current().ready else { reply("blocked"); return }
@@ -323,11 +380,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let restoring = coordinator.state == .listening || coordinator.state == .failed
         // Disable interception BEFORE activating the local panel. Its next Fn
         // belongs to Doubao even if the foreground polling tick has not run.
-        monitor.suspendEligibilityForComposer()
+        guard monitor.suspendEligibilityForDirectComposer() else { reply("busy"); return }
         guard coordinator.begin(target: target, mode: .tapToCompose, activationAllowed: {
             request.isFresh() && self.monitoringState == .active && !IsSecureEventInputEnabled() &&
             self.currentUURemoteTarget()?.processIdentifier == request.targetPID
-        }) else { reply("busy"); return }
+        }) else {
+            monitor.resumeEligibilityAfterRejectedComposer()
+            reply("busy")
+            return
+        }
         confirmComposerReady(generation: startGeneration, deadline: ProcessInfo.processInfo.systemUptime + 0.35,
                              success: restoring ? "restored" : "opened", reply: reply)
     }

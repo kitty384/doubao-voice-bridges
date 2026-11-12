@@ -17,6 +17,9 @@ final class TriggerHoldMonitor {
     private var foregroundRearm = FnForegroundRearmPolicy()
     private var foregroundIsUU = false
     private var rearmCount: UInt64 = 0
+    private var missedFn = FnMissRecoveryPolicy()
+    private var pendingMissDownCount: UInt64?
+    private var missedPressRefreshCount: UInt64 = 0
     private var composerHandoff = FnComposerHandoffPolicy()
     private var rearmWorkItem: DispatchWorkItem?
     private let holdThreshold: TimeInterval
@@ -99,13 +102,18 @@ final class TriggerHoldMonitor {
         }
     }
 
-    func stop() {
+    func stop() { stop(preservingMissRecoveryVisit: false) }
+
+    private func stop(preservingMissRecoveryVisit: Bool) {
         precondition(Thread.isMainThread)
         generation += 1
         pendingStart = nil
         // Keep observed foreground identity: an internal stop/start must not
         // appear as another UU entry and repeatedly rearm itself.
         foregroundRearm.cancelPending()
+        pendingMissDownCount = nil
+        if preservingMissRecoveryVisit { missedFn.dropObservation() }
+        else { missedFn.resetVisit() }
         composerHandoff.reset()
         rearmWorkItem?.cancel(); rearmWorkItem = nil
         // Wait for the old run loop to exit before any subsequent start. A pause
@@ -130,14 +138,35 @@ final class TriggerHoldMonitor {
         precondition(Thread.isMainThread)
         let targetAllowed = composerHandoff.allowsEligibility(
             targetAvailable: targetProvider() != nil, now: ProcessInfo.processInfo.systemUptime)
-        worker?.setEligible(gesture.phase == .idle && targetAllowed && !IsSecureEventInputEnabled())
+        let eligible = gesture.phase == .idle && targetAllowed && !IsSecureEventInputEnabled()
+        worker?.setEligible(eligible)
+        if !eligible { missedFn.dropObservation() }
     }
 
     func suspendEligibilityForComposer() {
         precondition(Thread.isMainThread)
         composerHandoff.suspend(now: ProcessInfo.processInfo.systemUptime)
         foregroundRearm.noteComposerOpening()
+        missedFn.dropObservation()
         worker?.setEligible(false)
+    }
+
+    /// Reserve the direct opening before calling out to AppKit/AX. A queued
+    /// physical Fn owns the session first; an explicit menu can also run with
+    /// no worker when listening was paused.
+    func suspendEligibilityForDirectComposer() -> Bool {
+        precondition(Thread.isMainThread)
+        guard gesture.phase == .idle, activePressID == nil,
+              !CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn) else { return false }
+        if let worker, !worker.suspendForDirectComposer() { return false }
+        suspendEligibilityForComposer()
+        return true
+    }
+
+    func resumeEligibilityAfterRejectedComposer() {
+        precondition(Thread.isMainThread)
+        composerHandoff.reset()
+        refreshEligibility()
     }
 
     var diagnosticSnapshot: [String: Any] {
@@ -151,6 +180,7 @@ final class TriggerHoldMonitor {
         snapshot["rearm_pending"] = foregroundRearm.pending != nil
         snapshot["rearm_reason"] = foregroundRearm.pending?.reason.rawValue ?? foregroundRearm.lastRearmReason?.rawValue ?? "none"
         snapshot["rearm_count"] = rearmCount
+        snapshot["missed_press_refresh_count"] = missedPressRefreshCount
         snapshot["rearm_generation"] = generation
         snapshot["rearm_observed_uu"] = foregroundIsUU
         return snapshot
@@ -166,6 +196,8 @@ final class TriggerHoldMonitor {
         if !isUU {
             rearmWorkItem?.cancel(); rearmWorkItem = nil
             composerHandoff.reset()
+            // A queued notification is not proof of a real foreground leave.
+            if !foregroundUUProvider() { resetMissedFnVisit() }
         }
         refreshEligibility()
         guard entered, let request = foregroundRearm.pending, worker != nil else { return }
@@ -204,6 +236,15 @@ final class TriggerHoldMonitor {
         guard let request = foregroundRearm.candidate(now: now),
               let input = worker, input.isIdle, gesture.phase == .idle,
               targetProvider() != nil, !IsSecureEventInputEnabled() else { return }
+        if request.reason == .missedPress {
+            // Never use a missing event as evidence to revive a disabled tap
+            // or an app whose input permissions were withdrawn.
+            guard let pendingMissDownCount, input.idleEligibleDownCount == pendingMissDownCount,
+                  PermissionStatus.current().ready, input.isTapOperational else {
+                cancelPendingMissedPress()
+                return
+            }
+        }
         let flags = CGEventSource.flagsState(.hidSystemState)
         let combinedFlags = CGEventSource.flagsState(.combinedSessionState)
         let modifiers = FnKeyPolicy.conflictingFlags.union(.maskSecondaryFn)
@@ -216,8 +257,14 @@ final class TriggerHoldMonitor {
             return
         }
         let commitNow = ProcessInfo.processInfo.systemUptime
-        guard foregroundRearm.candidate(now: commitNow)?.id == request.id,
-              input.reserveForegroundRearm(physicalKeysReleased: true) else { return }
+        guard foregroundRearm.candidate(now: commitNow)?.id == request.id else { return }
+        if request.reason == .missedPress, input.idleEligibleDownCount != pendingMissDownCount {
+            cancelPendingMissedPress()
+            return
+        }
+        let expectedDownCount = request.reason == .missedPress ? pendingMissDownCount : nil
+        guard !IsSecureEventInputEnabled(),
+              input.reserveForegroundRearm(physicalKeysReleased: true, expectedDownCount: expectedDownCount) else { return }
         // There is no main-thread interleaving between reservation and token
         // consumption. If invariants ever fail, finish teardown and stay paused.
         guard foregroundRearm.didRearm(requestID: request.id, now: commitNow) else {
@@ -226,7 +273,8 @@ final class TriggerHoldMonitor {
             return
         }
         rearmCount &+= 1
-        stop()
+        if request.reason == .missedPress { missedPressRefreshCount &+= 1 }
+        stop(preservingMissRecoveryVisit: true)
         start { [weak self] result in
             if case .failure(let error) = result { self?.onFault?(error.localizedDescription) }
         }
@@ -351,8 +399,11 @@ final class TriggerHoldMonitor {
             // Compensate for delayed/missed activation notifications.
             refreshForForegroundTransition(isUU: actualForeground)
         }
-        foregroundRearm.expire(now: ProcessInfo.processInfo.systemUptime)
-        if let recoveredID = worker?.recoverIfReleased(), activePressID == recoveredID {
+        let physicalFlags = CGEventSource.flagsState(.hidSystemState)
+        let now = ProcessInfo.processInfo.systemUptime
+        let physicalFnDown = physicalFlags.contains(.maskSecondaryFn)
+        foregroundRearm.expire(now: now)
+        if let recoveredID = worker?.recoverIfReleased(physicalFnDown: physicalFnDown, now: now), activePressID == recoveredID {
             // Recovery abandons this exact press; it must never submit text or
             // cancel a newer gesture whose down was already queued on main.
             reset(notifyCancel: true)
@@ -363,7 +414,40 @@ final class TriggerHoldMonitor {
             cancelOwned()
         }
         refreshEligibility()
+        observeMissedFn(actualForeground: actualForeground, physicalFlags: physicalFlags, now: now)
         attemptPendingRearm()
+    }
+
+    private func observeMissedFn(actualForeground: Bool, physicalFlags: CGEventFlags, now: TimeInterval) {
+        guard actualForeground else { resetMissedFnVisit(); return }
+        let downCount = gesture.phase == .idle && activePressID == nil ? worker?.idleEligibleDownCount : nil
+        if foregroundRearm.pending?.reason == .missedPress {
+            if downCount == nil || downCount != pendingMissDownCount { cancelPendingMissedPress() }
+        } else { pendingMissDownCount = nil }
+        guard !missedFn.issuedThisVisit else { return }
+        let modifiers = FnKeyPolicy.conflictingFlags
+        let cleanCount: UInt64?
+        if let downCount, physicalFlags.intersection(modifiers).isEmpty,
+           CGEventSource.flagsState(.combinedSessionState).intersection(modifiers).isEmpty {
+            cleanCount = downCount
+        } else { cleanCount = nil }
+        guard missedFn.observe(now: now, foregroundIsUU: true,
+                               physicalFnDown: physicalFlags.contains(.maskSecondaryFn), downCount: cleanCount),
+              let cleanCount else { return }
+        // Initial enable synchronizes foreground without queuing a regular
+        // refresh; an actual missed gesture may still request one in place.
+        foregroundRearm.observeForeground(true, now: now, requestsEnabled: true)
+        if foregroundRearm.requestMissedPressRefresh(now: now) { pendingMissDownCount = cleanCount }
+    }
+
+    private func cancelPendingMissedPress() {
+        if foregroundRearm.pending?.reason == .missedPress { foregroundRearm.cancelPending() }
+        pendingMissDownCount = nil
+    }
+
+    private func resetMissedFnVisit() {
+        missedFn.resetVisit()
+        cancelPendingMissedPress()
     }
 
     private func cancelOwned() { worker?.cancelOwnedPress(); reset(notifyCancel: true) }

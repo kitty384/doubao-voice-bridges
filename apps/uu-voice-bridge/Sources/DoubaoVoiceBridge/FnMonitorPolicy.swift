@@ -31,10 +31,80 @@ struct FnPressWatchdog {
     }
 }
 
+/// A physical Fn hold can be observed even if its event never reaches our tap.
+/// This only requests a refresh after release; it does not infer a tap to open
+/// the composer. A short tap or a hold spanning a sampling gap may be missed.
+struct FnMissRecoveryPolicy {
+    private struct ReleasedSample {
+        let at: TimeInterval
+        let downCount: UInt64
+    }
+    private struct Hold {
+        let beganAt: TimeInterval
+        var lastHeldAt: TimeInterval
+        let downCount: UInt64
+        var samples: Int
+    }
+
+    private static let minimumHeldDuration: TimeInterval = 0.15
+    private static let maximumSampleGap: TimeInterval = 0.35
+    private var releasedSample: ReleasedSample?
+    private var hold: Hold?
+    private(set) var issuedThisVisit = false
+
+    /// `downCount` is only supplied for an eligible idle tap with no queued or
+    /// owned gesture, in the absence of secure input or conflicting modifiers.
+    mutating func observe(now: TimeInterval, foregroundIsUU: Bool,
+                          physicalFnDown: Bool, downCount: UInt64?) -> Bool {
+        guard foregroundIsUU else { resetVisit(); return false }
+        guard !issuedThisVisit, let downCount else { dropObservation(); return false }
+
+        if physicalFnDown {
+            if var candidate = hold {
+                guard candidate.downCount == downCount,
+                      Self.samplesAreAdjacent(candidate.lastHeldAt, now) else {
+                    dropObservation()
+                    return false
+                }
+                candidate.lastHeldAt = now
+                candidate.samples += 1
+                hold = candidate
+            } else if let released = releasedSample, released.downCount == downCount,
+                      Self.samplesAreAdjacent(released.at, now) {
+                hold = Hold(beganAt: now, lastHeldAt: now, downCount: downCount, samples: 1)
+            }
+            // Never start a candidate in the middle of a hold, even when the
+            // target only just became eligible or the tap just received Fn.
+            releasedSample = nil
+            return false
+        }
+
+        let completed = hold
+        hold = nil
+        releasedSample = ReleasedSample(at: now, downCount: downCount)
+        guard let completed, completed.downCount == downCount, completed.samples >= 2,
+              completed.lastHeldAt - completed.beganAt >= Self.minimumHeldDuration,
+              Self.samplesAreAdjacent(completed.lastHeldAt, now) else { return false }
+        issuedThisVisit = true
+        dropObservation()
+        return true
+    }
+
+    mutating func dropObservation() { releasedSample = nil; hold = nil }
+    mutating func resetVisit() { dropObservation(); issuedThisVisit = false }
+
+    private static func samplesAreAdjacent(_ previous: TimeInterval, _ now: TimeInterval) -> Bool {
+        let gap = now - previous
+        return gap >= 0 && gap <= maximumSampleGap
+    }
+}
+
 /// One request is retained across temporary ineligibility. Expiry, leaving UU,
 /// pause and system failure cancel it; successful refresh consumes it exactly once.
 struct FnForegroundRearmPolicy {
-    enum Reason: String { case foregroundEntry = "foreground_entry", postDelivery = "post_delivery" }
+    enum Reason: String {
+        case foregroundEntry = "foreground_entry", postDelivery = "post_delivery", missedPress = "missed_press"
+    }
     struct Request {
         let id: UInt64
         var reason: Reason
@@ -77,19 +147,32 @@ struct FnForegroundRearmPolicy {
         expire(now: now)
         guard requestsEnabled, isUU, !postDeliveryIssuedThisEntry else { return false }
         postDeliveryIssuedThisEntry = true
+        requestImmediateRefresh(reason: .postDelivery, now: now)
+        return true
+    }
+
+    /// Only call after the visit-limited physical hold detector observes release.
+    @discardableResult
+    mutating func requestMissedPressRefresh(now: TimeInterval) -> Bool {
+        expire(now: now)
+        guard requestsEnabled, isUU else { return false }
+        requestImmediateRefresh(reason: .missedPress, now: now)
+        return true
+    }
+
+    private mutating func requestImmediateRefresh(reason: Reason, now: TimeInterval) {
         if var request = pending {
-            request.reason = .postDelivery
+            request.reason = reason
             request.notBefore = now
             request.expiresAt = now + 5
             pending = request
-        } else { create(reason: .postDelivery, now: now, delay: 0) }
-        return true
+        } else { create(reason: reason, now: now, delay: 0) }
     }
 
     mutating func candidate(now: TimeInterval) -> Request? {
         expire(now: now)
         guard requestsEnabled, isUU, let request = pending, now >= request.notBefore else { return nil }
-        let interval = request.reason == .postDelivery ? 0.25 : 3.0
+        let interval = request.reason == .foregroundEntry ? 3.0 : 0.25
         guard lastRearm.map({ now - $0 >= interval }) ?? true else { return nil }
         return request
     }
